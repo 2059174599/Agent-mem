@@ -72,15 +72,19 @@ class UnifiedLoggingConfig:
         """配置特定模块的日志器"""
         # 需要特殊配置的模块
         modules = [
+            'api',
             'models.redis_models',
             'services.llm_semantic_search_service',
             'services.async_memory_service_v2',
             'services.redis_cache_service',
+            'services.unified_cache_service',
+            'services.fact_extraction_service',
             'models.es_models',
             'elastic_transport.transport',
             'elasticsearch',
             'httpx',
-            'aiohttp'
+            'aiohttp',
+            'uvicorn.access'
         ]
         
         for module_name in modules:

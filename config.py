@@ -486,7 +486,7 @@ class Config:
     
     @classmethod
     def get_app_port(cls) -> int:
-        return cls.get_env_or_default_int("APP_PORT", 5010)
+        return cls.get_env_or_default_int("APP_PORT", 8000)
     
     @classmethod
     def get_app_host(cls) -> str:
