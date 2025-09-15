@@ -12,6 +12,7 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 import asyncio
@@ -28,11 +29,61 @@ from logging_config import setup_logging, get_logger
 setup_logging()
 logger = get_logger(__name__)
 
+# 全局异步服务实例
+async_memory_service = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    global async_memory_service
+    
+    # 启动事件
+    logger.info("🚀 开始启动FastAPI记忆服务...")
+    
+    try:
+        # 初始化服务
+        logger.info("📦 初始化异步记忆服务...")
+        async_memory_service = AsyncMemoryServiceV2()
+        await async_memory_service.__aenter__()
+        
+        # 测试服务连接
+        logger.info("🔍 测试服务连接...")
+        
+        # 测试Redis连接
+        try:
+            cache_stats = await async_memory_service.get_performance_stats()
+            logger.info(f"✅ Redis缓存服务连接成功: {cache_stats.get('stats', {}).get('redis_cache', {})}")
+        except Exception as e:
+            logger.warning(f"⚠️ Redis缓存服务连接测试失败: {e}")
+        
+        # 测试ES连接
+        try:
+            # 这里可以添加ES连接测试
+            logger.info("✅ Elasticsearch服务连接正常")
+        except Exception as e:
+            logger.warning(f"⚠️ Elasticsearch服务连接测试失败: {e}")
+        
+        logger.info("🎉 FastAPI记忆服务启动完成！")
+        logger.info(f"📊 服务配置: 端口={Config.get_app_port()}, 日志级别={Config.get_log_level()}")
+        
+    except Exception as e:
+        logger.error(f"❌ FastAPI记忆服务启动失败: {e}")
+        raise
+    
+    yield
+    
+    # 关闭事件
+    logger.info("🛑 开始关闭FastAPI记忆服务...")
+    if async_memory_service:
+        await async_memory_service.__aexit__(None, None, None)
+    logger.info("FastAPI记忆服务关闭完成")
+
 # 创建FastAPI应用
 app = FastAPI(
     title="Agent Memo API",
     description="智能记忆服务API",
-    version="2.0.0"
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # 添加CORS中间件
@@ -92,53 +143,6 @@ class HealthResponse(BaseModel):
     version: str
     performance: Dict[str, Any]
 
-# 全局异步服务实例
-async_memory_service = None
-
-@app.on_event("startup")
-async def startup_event():
-    """应用启动事件"""
-    global async_memory_service
-    logger.info("🚀 开始启动FastAPI记忆服务...")
-    
-    try:
-        # 初始化服务
-        logger.info("📦 初始化异步记忆服务...")
-        async_memory_service = AsyncMemoryServiceV2()
-        await async_memory_service.__aenter__()
-        
-        # 测试服务连接
-        logger.info("🔍 测试服务连接...")
-        
-        # 测试Redis连接
-        try:
-            cache_stats = await async_memory_service.get_performance_stats()
-            logger.info(f"✅ Redis缓存服务连接成功: {cache_stats.get('stats', {}).get('redis_cache', {})}")
-        except Exception as e:
-            logger.warning(f"⚠️ Redis缓存服务连接测试失败: {e}")
-        
-        # 测试ES连接
-        try:
-            # 这里可以添加ES连接测试
-            logger.info("✅ Elasticsearch服务连接正常")
-        except Exception as e:
-            logger.warning(f"⚠️ Elasticsearch服务连接测试失败: {e}")
-        
-        logger.info("🎉 FastAPI记忆服务启动完成！")
-        logger.info(f"📊 服务配置: 端口={Config.get_app_port()}, 日志级别={Config.get_log_level()}")
-        
-    except Exception as e:
-        logger.error(f"❌ FastAPI记忆服务启动失败: {e}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭事件"""
-    global async_memory_service
-    if async_memory_service:
-        await async_memory_service.__aexit__(None, None, None)
-    logger.info("FastAPI记忆服务关闭完成")
-
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """健康检查 - 增强版本"""
@@ -149,7 +153,7 @@ async def health_check():
         
         return HealthResponse(
             status="healthy",
-            service="yaxin_memo_fastapi",
+            service="yixin_memo_fastapi",
             version="2.0.0",
             performance={
                 "cache_size": cache_size,
@@ -159,7 +163,7 @@ async def health_check():
     except Exception as e:
         return HealthResponse(
             status="unhealthy",
-            service="yaxin_memo_fastapi",
+            service="yixin_memo_fastapi",
             version="2.0.0",
             performance={
                 "cache_size": 0,

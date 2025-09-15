@@ -84,17 +84,27 @@ class FactDocument:
 class RedisService:
     """Redis服务类 - 使用统一缓存服务"""
     
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(RedisService, cls).__new__(cls)
+        return cls._instance
+    
     def __init__(self):
-        logger.info(f"初始化redis连接，节点: {Config.get_redis_host()}:{Config.get_redis_port()}")
-        self.redis = redis.Redis(
-            host=Config.get_redis_host(),
-            port=Config.get_redis_port(),
-            password=Config.get_redis_password(),
-            db=Config.get_redis_db(),
-            decode_responses=True
-        )
-        # 使用统一缓存服务
-        self.cache = unified_cache_service
+        if not self._initialized:
+            logger.info(f"初始化redis连接，节点: {Config.get_redis_host()}:{Config.get_redis_port()}")
+            self.redis = redis.Redis(
+                host=Config.get_redis_host(),
+                port=Config.get_redis_port(),
+                password=Config.get_redis_password(),
+                db=Config.get_redis_db(),
+                decode_responses=True
+            )
+            # 使用统一缓存服务
+            self.cache = unified_cache_service
+            RedisService._initialized = True
     
     def _get_facts_key(self, user_id: str, agent_id: Optional[str] = None) -> str:
         """获取事实存储的key - 使用统一前缀"""

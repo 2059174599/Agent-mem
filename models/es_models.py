@@ -46,10 +46,20 @@ class ChatDocument:
 class ESService:
     """ES服务类 - 只负责对话存储和搜索"""
     
+    _instance = None
+    _initialized = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(ESService, cls).__new__(cls)
+        return cls._instance
+    
     def __init__(self):
-        self.es = None
-        self.index_created = False
-        self._init_es_connection()
+        if not self._initialized:
+            self.es = None
+            self.index_created = False
+            self._init_es_connection()
+            ESService._initialized = True
     
     def _init_es_connection(self):
         """初始化ES连接 - 支持集群配置"""
