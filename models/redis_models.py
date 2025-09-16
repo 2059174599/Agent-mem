@@ -106,6 +106,22 @@ class RedisService:
             self.cache = unified_cache_service
             RedisService._initialized = True
     
+    async def init_predefined_topics(self):
+        """初始化预定义主题到Redis"""
+        try:
+            predefined_topics = Config.get_predefined_topics()
+            
+            # 将预定义主题存储到Redis
+            await self.cache.set("temp", "predefined_topics", predefined_topics, 86400)  # 24小时过期
+            
+            logger.info(f"预定义主题已初始化: {len(predefined_topics)} 个主题")
+            for topic, sub_topics in predefined_topics.items():
+                logger.info(f"  - {topic}: {len(sub_topics)} 个子主题")
+                
+        except Exception as e:
+            logger.error(f"初始化预定义主题失败: {e}")
+            raise
+    
     def _get_facts_key(self, user_id: str, agent_id: Optional[str] = None) -> str:
         """获取事实存储的key - 使用统一前缀"""
         if agent_id:
@@ -590,6 +606,101 @@ class RedisService:
             
         except Exception as e:
             logger.error(f"删除事实失败: {e}")
+            return False
+    
+    async def delete_fact_by_chat_id(self, user_id: str, chat_id: str, 
+                                   agent_id: Optional[str] = None) -> bool:
+        """根据chat_id删除事实"""
+        try:
+            key = self._get_facts_key(user_id, agent_id)
+            facts = await self.cache.get_user_facts(key) or {}
+            
+            # 查找匹配chat_id的事实
+            fact_to_delete = None
+            for fact_key, fact_data in facts.items():
+                if fact_data.get("chat_id") == chat_id:
+                    fact_to_delete = fact_key
+                    break
+            
+            if fact_to_delete:
+                del facts[fact_to_delete]
+                await self.cache.set_user_facts(key, facts)
+                logger.info(f"根据chat_id删除事实成功: {fact_key}")
+                return True
+            else:
+                logger.warning(f"未找到chat_id为{chat_id}的事实")
+                return False
+        except Exception as e:
+            logger.error(f"根据chat_id删除事实失败: {e}")
+            return False
+    
+    async def delete_all_facts(self, user_id: str, agent_id: Optional[str] = None) -> bool:
+        """删除用户所有事实"""
+        try:
+            key = self._get_facts_key(user_id, agent_id)
+            await self.cache.set_user_facts(key, {})
+            logger.info(f"删除用户所有事实成功: {key}")
+            return True
+        except Exception as e:
+            logger.error(f"删除用户所有事实失败: {e}")
+            return False
+    
+    async def update_fact_by_chat_id(self, user_id: str, chat_id: str, 
+                                   new_memo: str, agent_id: Optional[str] = None,
+                                   new_topic: Optional[str] = None, new_sub_topic: Optional[str] = None) -> bool:
+        """根据chat_id更新事实的memo、topic和sub_topic"""
+        try:
+            key = self._get_facts_key(user_id, agent_id)
+            facts = await self.cache.get_user_facts(key) or {}
+            
+            # 查找匹配chat_id的事实
+            fact_to_update = None
+            for fact_key, fact_data in facts.items():
+                if fact_data.get("chat_id") == chat_id:
+                    fact_to_update = fact_key
+                    break
+            
+            if fact_to_update:
+                # 更新memo
+                facts[fact_to_update]["memo"] = new_memo
+                
+                # 如果提供了新的topic和sub_topic，需要更新
+                if new_topic and new_sub_topic:
+                    # 删除旧的事实键
+                    old_fact_data = facts[fact_to_update].copy()
+                    del facts[fact_to_update]
+                    
+                    # 创建新的事实键
+                    new_fact_key = f"{new_topic}:{new_sub_topic}"
+                    facts[new_fact_key] = old_fact_data
+                    facts[new_fact_key]["topic"] = new_topic
+                    facts[new_fact_key]["sub_topic"] = new_sub_topic
+                    fact_to_update = new_fact_key
+                elif new_topic:
+                    # 只更新topic，保持sub_topic不变
+                    facts[fact_to_update]["topic"] = new_topic
+                elif new_sub_topic:
+                    # 只更新sub_topic，保持topic不变
+                    facts[fact_to_update]["sub_topic"] = new_sub_topic
+                    # 需要更新事实键
+                    old_fact_data = facts[fact_to_update].copy()
+                    del facts[fact_to_update]
+                    new_fact_key = f"{old_fact_data['topic']}:{new_sub_topic}"
+                    facts[new_fact_key] = old_fact_data
+                    fact_to_update = new_fact_key
+                
+                # 更新时间戳
+                facts[fact_to_update]["updated_at"] = datetime.now().isoformat()
+                facts[fact_to_update]["timestamp"] = facts[fact_to_update]["updated_at"]  # 保持兼容性
+                
+                await self.cache.set_user_facts(key, facts)
+                logger.info(f"根据chat_id更新事实成功: {fact_to_update}")
+                return True
+            else:
+                logger.warning(f"未找到chat_id为{chat_id}的事实")
+                return False
+        except Exception as e:
+            logger.error(f"根据chat_id更新事实失败: {e}")
             return False
     
     def get_facts_by_topic(self, user_id: str, topic: str, 

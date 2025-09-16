@@ -21,6 +21,7 @@ import logging
 from services.async_memory_service_v2 import AsyncMemoryServiceV2
 from services.unified_cache_service import unified_cache_service
 from services.async_logging_service import async_logging_service, log_info, log_error
+from services.memory_management_service import MemoryManagementService
 from middleware.simple_auth import SimpleAuthMiddleware, get_current_user_id, get_auth_status
 from config import Config
 from logging_config import setup_logging, get_logger
@@ -31,6 +32,7 @@ logger = get_logger(__name__)
 
 # 全局异步服务实例
 async_memory_service = None
+memory_management_service = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -62,6 +64,20 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Elasticsearch服务连接正常")
         except Exception as e:
             logger.warning(f"⚠️ Elasticsearch服务连接测试失败: {e}")
+        
+        # 初始化预定义主题到Redis
+        try:
+            await async_memory_service.redis_service.init_predefined_topics()
+            logger.info("✅ 预定义主题配置完成")
+        except Exception as e:
+            logger.warning(f"⚠️ 预定义主题配置失败: {e}")
+        
+        # 初始化记忆管理服务
+        global memory_management_service
+        memory_management_service = MemoryManagementService(
+            async_memory_service.redis_service,
+            unified_cache_service
+        )
         
         logger.info("🎉 FastAPI记忆服务启动完成！")
         logger.info(f"📊 服务配置: 端口={Config.get_app_port()}, 日志级别={Config.get_log_level()}")
@@ -136,6 +152,34 @@ class AddOrUpdateMemoryRequest(BaseModel):
     memo: str
     agentId: Optional[str] = None
     chatId: Optional[str] = None
+
+# 新的记忆管理请求模型
+class MemoryQueryRequest(BaseModel):
+    """查询记忆请求"""
+    userId: str
+    agentId: Optional[str] = None
+    topic: Optional[str] = None  # 可选：按主题过滤
+    limit: int = 50
+    offset: int = 0
+
+class MemoryManageRequest(BaseModel):
+    """记忆管理请求 - 支持增删改查"""
+    action: str  # "add", "update", "delete", "query"
+    userId: str
+    agentId: Optional[str] = None
+    
+    # 查询参数
+    topic: Optional[str] = None
+    limit: int = 50
+    offset: int = 0
+    
+    # 添加/更新参数
+    memoryId: Optional[str] = None  # chat_id，用于更新/删除特定记忆
+    subTopic: Optional[str] = None  # 子主题
+    memo: Optional[str] = None      # 记忆内容
+    
+    # 删除参数
+    deleteAll: bool = False  # 是否删除用户所有记忆
 
 class HealthResponse(BaseModel):
     status: str
@@ -249,81 +293,121 @@ async def search_memory(request: SearchMemoryRequest, current_user_id: str = Dep
             "message": "记忆搜索失败"
         })
 
+@app.post("/memory/query")
+async def query_memory(request: MemoryQueryRequest, current_user_id: str = Depends(get_current_user_id)):
+    """查询记忆 - 支持根据用户ID或Agent ID查询"""
+    try:
+        # 验证用户ID
+        if not request.userId:
+            return JSONResponse(
+                content={"success": False, "error": "用户ID不能为空"},
+                status_code=400
+            )
+        
+        # 调用记忆管理服务
+        result = await memory_management_service.query_memory(
+            user_id=request.userId,
+            agent_id=request.agentId,
+            topic=request.topic,
+            limit=request.limit,
+            offset=request.offset
+        )
+        
+        return JSONResponse(content=result, status_code=200 if result["success"] else 500)
+            
+    except Exception as e:
+        await log_error("api", f"❌ 记忆查询异常: {e}")
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
+
 @app.post("/memory/manage")
 async def manage_memory(request: MemoryManageRequest, current_user_id: str = Depends(get_current_user_id)):
-    """记忆管理 - 查询和更新Redis中的事实数据"""
-    start_time = time.time()
-    request_id = f"manage_{int(time.time() * 1000)}"
-    
+    """
+    记忆管理 - 支持添加、修改、删除记忆 \n
+    action：添加：add、修改：update、删除：delete\n
+    memoryId：查询记忆获取的chat_id
+    """
     try:
-        await log_info("api", f"🔧 [{request_id}] 收到记忆管理请求: action={request.action}, user_id={request.userId}")
-        
-        if request.action == "query":
-            # 查询事实
-            result = await async_memory_service.query_facts_async(
-                user_id=request.userId,
-                agent_id=request.agentId,
-                limit=request.limit,
-                offset=request.offset
+        # 验证用户ID
+        if not request.userId:
+            return JSONResponse(
+                content={"success": False, "error": "用户ID不能为空"},
+                status_code=400
             )
-        elif request.action == "update":
-            # 更新事实
-            if not request.memoryId or not request.topic or not request.subTopic or not request.newMemo:
-                raise HTTPException(status_code=400, detail={
-                    "success": False,
-                    "error": "更新操作需要提供memoryId、topic、subTopic和newMemo",
-                    "message": "参数错误"
-                })
+        
+        # 根据操作类型调用相应的服务方法
+        if request.action == "add":
+            if not request.subTopic or not request.memo:
+                return JSONResponse(
+                    content={"success": False, "error": "添加记忆需要提供subTopic和memo"},
+                    status_code=400
+                )
             
-            result = await async_memory_service.update_fact_async(
+            result = await memory_management_service.add_memory(
                 user_id=request.userId,
                 agent_id=request.agentId,
                 topic=request.topic,
                 sub_topic=request.subTopic,
-                new_memo=request.newMemo
+                memo=request.memo,
+                memory_id=request.memoryId
             )
-        else:
-            raise HTTPException(status_code=400, detail={
-                "success": False,
-                "error": "action必须是'query'或'update'",
-                "message": "参数错误"
-            })
-        
-        processing_time = time.time() - start_time
-        result["api_processing_time"] = processing_time
-        
-        if result['success']:
-            if request.action == "query":
-                facts_count = len(result.get('facts', []))
-                await log_info("api", f"✅ [{request_id}] 查询事实成功: {facts_count}个事实, 耗时: {processing_time:.3f}秒")
-            else:
-                await log_info("api", f"✅ [{request_id}] 更新事实成功: 耗时: {processing_time:.3f}秒")
-            return result
-        else:
-            await log_error("api", f"❌ [{request_id}] 记忆管理失败: {result.get('message', '未知错误')}, 耗时: {processing_time:.3f}秒")
-            raise HTTPException(status_code=500, detail=result)
             
-    except HTTPException:
-        raise
+        elif request.action == "update":
+            if not request.memoryId or not request.memo:
+                return JSONResponse(
+                    content={"success": False, "error": "更新记忆需要提供memoryId和memo"},
+                    status_code=400
+                )
+            
+            result = await memory_management_service.update_memory(
+                user_id=request.userId,
+                agent_id=request.agentId,
+                memory_id=request.memoryId,
+                memo=request.memo,
+                topic=request.topic,
+                sub_topic=request.subTopic
+            )
+            
+        elif request.action == "delete":
+            result = await memory_management_service.delete_memory(
+                user_id=request.userId,
+                agent_id=request.agentId,
+                memory_id=request.memoryId,
+                delete_all=request.deleteAll
+            )
+            
+        else:
+            return JSONResponse(
+                content={"success": False, "error": f"不支持的操作: {request.action}"},
+                status_code=400
+            )
+        
+        return JSONResponse(content=result, status_code=200 if result["success"] else 500)
+            
     except Exception as e:
-        processing_time = time.time() - start_time
-        await log_error("api", f"❌ [{request_id}] 记忆管理异常: {e}, 耗时: {processing_time:.3f}秒")
-        raise HTTPException(status_code=500, detail={
-            "success": False,
-            "error": str(e),
-            "message": "记忆管理失败"
-        })
+        await log_error("api", f"❌ 记忆管理异常: {e}")
+        return JSONResponse(
+            content={"success": False, "error": str(e)},
+            status_code=500
+        )
 
 @app.get("/topics")
 async def get_topics(current_user_id: str = Depends(get_current_user_id)):
     """获取预定义主题"""
-    await log_info("api", "📋 收到获取主题请求")
-    topics = Config.get_predefined_topics()
-    await log_info("api", f"✅ 返回 {len(topics)} 个预定义主题")
-    return {
-        "success": True,
-        "topics": topics
-    }
+    try:
+        topics = await memory_management_service.get_predefined_topics()
+        return {
+            "success": True,
+            "topics": topics
+        }
+    except Exception as e:
+        await log_error("api", f"❌ 获取主题失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 @app.get("/performance")
 async def get_performance(current_user_id: str = Depends(get_current_user_id)):
@@ -459,32 +543,6 @@ async def clear_cache_api(current_user_id: str = Depends(get_current_user_id)):
         await log_error("api", f"❌ 清理缓存失败: {e}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 
-@app.post("/memory/add-or-update", summary="添加或更新记忆")
-async def add_or_update_memory_api(request: AddOrUpdateMemoryRequest, current_user_id: str = Depends(get_current_user_id)):
-    """添加或更新记忆 - 支持指定主题和小主题"""
-    try:
-        await log_info("api", f"🔄 收到添加或更新记忆请求: user_id={request.userId}, topic={request.topic}, sub_topic={request.subTopic}")
-        
-        async with AsyncMemoryServiceV2() as memory_service:
-            result = await memory_service.add_or_update_memory_async(
-                user_id=request.userId,
-                topic=request.topic,
-                sub_topic=request.subTopic,
-                memo=request.memo,
-                agent_id=request.agentId,
-                chat_id=request.chatId
-            )
-            
-            if result.get("success"):
-                await log_info("api", f"✅ 记忆操作成功: {result.get('action')}")
-            else:
-                await log_error("api", f"❌ 记忆操作失败: {result.get('error')}")
-            
-            return JSONResponse(content=result)
-            
-    except Exception as e:
-        await log_error("api", f"❌ 添加或更新记忆异常: {e}")
-        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 
 @app.post("/memory/cleanup", summary="清理脏数据")
 async def cleanup_dirty_data_api(
