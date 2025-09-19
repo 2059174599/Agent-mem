@@ -566,20 +566,33 @@ class AsyncMemoryServiceV2:
     
     async def _search_chats_async(self, user_id: str, query: str, 
                                  agent_id: Optional[str], limit: int) -> Dict:
-        """异步搜索对话"""
+        """异步搜索对话 - 带超时处理"""
         try:
             # 获取查询的embedding
             query_embedding = await self.async_get_embedding(query)
             
+            # 设置ES查询超时时间（秒）
+            es_timeout = Config.get_search_strategies().get("es_search_timeout", 10)
+            
             if not query_embedding:
                 # 如果没有embedding，使用纯关键词搜索
-                similar_chats = self.es_service.search_similar_chats_by_question_only(
-                    user_id, query, limit
+                similar_chats = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, 
+                        self.es_service.search_similar_chats_by_question_only,
+                        user_id, query, limit
+                    ),
+                    timeout=es_timeout
                 )
             else:
                 # 使用混合搜索（关键词 + 向量相似度）
-                similar_chats = self.es_service.search_similar_chats(
-                    user_id, query, query_embedding, agent_id, limit
+                similar_chats = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self.es_service.search_similar_chats,
+                        user_id, query, query_embedding, agent_id, limit
+                    ),
+                    timeout=es_timeout
                 )
             
             # 格式化结果
@@ -598,18 +611,31 @@ class AsyncMemoryServiceV2:
                 "chats": chats_formatted
             }
             
+        except asyncio.TimeoutError:
+            await log_error("search_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
+            return {"success": False, "chats": [], "error": "ES查询超时"}
         except Exception as e:
             await log_error("search_chats", f"对话搜索失败: {e}")
-            return {"success": False, "chats": []}
+            return {"success": False, "chats": [], "error": str(e)}
     
     async def _get_recent_chats_async(self, user_id: str, agent_id: Optional[str], 
                                     limit: int = 20) -> Dict:
-        """获取最近N轮对话"""
+        """获取最近N轮对话 - 带超时处理"""
         try:
             await log_info("recent_chats", f"获取最近{limit}轮对话: user_id={user_id}")
             
+            # 设置ES查询超时时间（秒）
+            es_timeout = Config.get_search_strategies().get("es_search_timeout", 10)
+            
             # 从ES获取最近对话
-            recent_chats = self.es_service.get_recent_chats(user_id, agent_id, limit)
+            recent_chats = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.es_service.get_recent_chats,
+                    user_id, agent_id, limit
+                ),
+                timeout=es_timeout
+            )
             
             # 格式化结果
             chats_formatted = []
@@ -629,9 +655,12 @@ class AsyncMemoryServiceV2:
                 "chats": chats_formatted
             }
             
+        except asyncio.TimeoutError:
+            await log_error("recent_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
+            return {"success": False, "chats": [], "error": "ES查询超时"}
         except Exception as e:
             await log_error("recent_chats", f"获取最近对话失败: {e}")
-            return {"success": False, "chats": []}
+            return {"success": False, "chats": [], "error": str(e)}
     
     async def cleanup_dirty_data_async(self, user_id: str = None, agent_id: str = None, 
                                       test_limit: int = 100, dry_run: bool = False) -> Dict:

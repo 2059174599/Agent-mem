@@ -430,7 +430,9 @@ class Config:
             
             # LLM搜索配置（当启用时使用）
             "llm_search_timeout": cls.get_env_or_default_int("SEARCH_LLM_TIMEOUT", 30),
-            "llm_search_temperature": cls.get_env_or_default_float("SEARCH_LLM_TEMPERATURE", 0.1)
+            "llm_search_temperature": cls.get_env_or_default_float("SEARCH_LLM_TEMPERATURE", 0.1),
+            # ES搜索超时配置
+            "es_search_timeout": cls.get_env_or_default_int("ES_SEARCH_TIMEOUT", 5)
         }
     
     @classmethod
