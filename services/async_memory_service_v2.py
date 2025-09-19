@@ -613,7 +613,7 @@ class AsyncMemoryServiceV2:
             
         except asyncio.TimeoutError:
             await log_error("search_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
-            return {"success": False, "chats": [], "error": "ES查询超时"}
+            return {"success": True, "chats": []}
         except Exception as e:
             await log_error("search_chats", f"对话搜索失败: {e}")
             return {"success": False, "chats": [], "error": str(e)}
