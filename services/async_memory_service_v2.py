@@ -572,7 +572,13 @@ class AsyncMemoryServiceV2:
             query_embedding = await self.async_get_embedding(query)
             
             # 设置ES查询超时时间（秒）
-            es_timeout = Config.get_search_strategies().get("es_search_timeout", 10)
+            es_timeout = Config.get_search_strategies().get("es_search_timeout", 2)
+
+            # # 根据查询复杂度动态调整超时时间
+            # if len(query) > 1000:  # 长查询需要更多时间
+            #     es_timeout = min(es_timeout * 1.5, 30)
+            # elif len(query) < 50:   # 短查询可以更快超时
+            #     es_timeout = max(es_timeout * 0.7, 10)
             
             if not query_embedding:
                 # 如果没有embedding，使用纯关键词搜索
@@ -612,8 +618,8 @@ class AsyncMemoryServiceV2:
             }
             
         except asyncio.TimeoutError:
-            await log_error("search_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
-            return {"success": True, "chats": []}
+            await log_warning("search_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
+            return {"success": False, "chats": [], "error": "ES查询超时"}
         except Exception as e:
             await log_error("search_chats", f"对话搜索失败: {e}")
             return {"success": False, "chats": [], "error": str(e)}
@@ -656,7 +662,7 @@ class AsyncMemoryServiceV2:
             }
             
         except asyncio.TimeoutError:
-            await log_error("recent_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
+            await log_warning("recent_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
             return {"success": False, "chats": [], "error": "ES查询超时"}
         except Exception as e:
             await log_error("recent_chats", f"获取最近对话失败: {e}")
