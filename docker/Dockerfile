@@ -1,5 +1,5 @@
-# 使用Python 3.11官方镜像
-FROM python:3.11-slim
+# 使用Python 3.10官方镜像
+FROM python:3.12-slim
 
 # 设置工作目录
 WORKDIR /app
@@ -47,8 +47,8 @@ USER app
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令
-ENTRYPOINT ["/bin/bash", "/app/start.sh"]
+# 启动命令 - 直接运行Python应用
+CMD ["python", "app.py"]
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
