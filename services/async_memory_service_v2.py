@@ -290,7 +290,7 @@ class AsyncMemoryServiceV2:
             if quality_score < config["min_llm_score"]:
                 return {
                     "is_valid": False,
-                    "reason": f"LLM质量评估分数过低，低于{config['min_llm_score']}",
+                    "reason": f"LLM质量评估分数过低{quality_score}，低于{config['min_llm_score']}",
                     "score": quality_score
                 }
             
@@ -564,10 +564,16 @@ class AsyncMemoryServiceV2:
             await log_error("search_facts", f"事实搜索失败: {e}")
             return {"success": False, "facts": []}
     
-    async def _search_chats_async(self, user_id: str, query: str, 
+    async def _search_chats_async(self, user_id: str, query: str,
                                  agent_id: Optional[str], limit: int) -> Dict:
         """异步搜索对话 - 带超时处理"""
         try:
+            # 检查查询长度，如果过长则不进行ES搜索
+            max_query_length = Config.get_search_max_query_length()
+            if len(query) > max_query_length:
+                await log_warning("search_chats", f"查询过长跳过ES搜索: 问[{query[:100]}...] 长度{len(query)}, 超过限制{max_query_length}")
+                return {"success": True, "chats": []}
+
             # 获取查询的embedding
             query_embedding = await self.async_get_embedding(query)
             
@@ -601,16 +607,40 @@ class AsyncMemoryServiceV2:
                     timeout=es_timeout
                 )
             
-            # 格式化结果
+            # 格式化并过滤结果
             chats_formatted = []
+            seen_qa_pairs = set()  # 用于去重相同的问题答案对
+
+            # 获取配置参数
+            max_question_length = Config.get_search_max_question_length()
+            max_answer_length = Config.get_search_max_answer_length()
+            max_results = Config.get_search_max_results()
+
             for chat in similar_chats:
+                question = chat["question"]
+                answer = chat["answer"]
+
+                # 过滤掉过长的问答
+                if len(question) > max_question_length or len(answer) > max_answer_length:
+                    continue
+
+                # 去重：相同问题和答案只保留一个（保留最近的）
+                qa_pair = (question, answer)
+                if qa_pair in seen_qa_pairs:
+                    continue
+                seen_qa_pairs.add(qa_pair)
+
                 chats_formatted.append({
-                    "question": chat["question"],
-                    "answer": chat["answer"],
+                    "question": question,
+                    "answer": answer,
                     "timestamp": chat["timestamp"],
                     "agent_id": chat.get("agent_id"),
                     "_score": chat.get("_score", 0.0)  # 包含相关性分数
                 })
+
+                # 限制总结果数量
+                if len(chats_formatted) >= max_results:
+                    break
             
             return {
                 "success": True,
@@ -1148,12 +1178,17 @@ class AsyncMemoryServiceV2:
     async def _clear_project_cache(self) -> int:
         """清理项目缓存数据 - 使用精确的前缀"""
         try:
+            # 检查是否启用缓存统计（间接判断是否支持KEYS命令）
+            if not Config.get_enable_cache_stats():
+                await log_warning("cache", "缓存统计功能已禁用，跳过缓存清理以避免KEYS命令错误")
+                return 0
+
             # 获取Redis客户端
             redis_client = self.cache_service.redis_client
-            
+
             # 查找所有 yaxin_memo:cache: 开头的键
             cache_keys = redis_client.keys("yaxin_memo:cache:*")
-            
+
             if cache_keys:
                 deleted_count = redis_client.delete(*cache_keys)
                 await log_info("cache", f"清理项目缓存: 找到{len(cache_keys)}个键，删除{deleted_count}个")
@@ -1161,7 +1196,7 @@ class AsyncMemoryServiceV2:
             else:
                 await log_info("cache", "未找到项目缓存数据")
                 return 0
-                
+
         except Exception as e:
             await log_error("cache", f"清理项目缓存失败: {e}")
             return 0
@@ -1169,12 +1204,17 @@ class AsyncMemoryServiceV2:
     async def _clear_redis_facts(self) -> int:
         """清理Redis中的事实数据"""
         try:
+            # 检查是否启用缓存统计（间接判断是否支持KEYS命令）
+            if not Config.get_enable_cache_stats():
+                await log_warning("cache", "缓存统计功能已禁用，跳过事实数据清理以避免KEYS命令错误")
+                return 0
+
             # 获取Redis客户端
             redis_client = self.redis_service.redis
-            
+
             # 查找所有facts:开头的键
             fact_keys = redis_client.keys("facts:*")
-            
+
             if fact_keys:
                 deleted_count = redis_client.delete(*fact_keys)
                 await log_info("cache", f"清理Redis事实数据: 找到{len(fact_keys)}个键，删除{deleted_count}个")
@@ -1182,7 +1222,7 @@ class AsyncMemoryServiceV2:
             else:
                 await log_info("cache", "未找到Redis事实数据")
                 return 0
-                
+
         except Exception as e:
             await log_error("cache", f"清理Redis事实数据失败: {e}")
             return 0

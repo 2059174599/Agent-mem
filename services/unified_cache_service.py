@@ -194,13 +194,31 @@ class UnifiedCacheService:
         try:
             info = self.redis_client.info('memory')
             keyspace = self.redis_client.info('keyspace')
-            
+
+            # 检查是否启用缓存统计
+            if not Config.get_enable_cache_stats():
+                logger.debug("缓存统计功能已禁用，返回基础信息")
+                return {
+                    "cache_counts": {cache_type: 0 for cache_type in self.cache_prefixes.keys()},
+                    "total_keys": 0,
+                    "memory_used": info.get('used_memory_human', 'N/A'),
+                    "memory_peak": info.get('used_memory_peak_human', 'N/A'),
+                    "keyspace": keyspace,
+                    "base_prefix": self.base_prefix,
+                    "stats": self.stats,
+                    "stats_disabled": True
+                }
+
             # 获取各类型缓存键数量
             cache_counts = {}
             for cache_type, prefix in self.cache_prefixes.items():
-                keys = self.redis_client.keys(f"{prefix}:*")
-                cache_counts[cache_type] = len(keys)
-            
+                try:
+                    keys = self.redis_client.keys(f"{prefix}:*")
+                    cache_counts[cache_type] = len(keys)
+                except Exception as e:
+                    logger.warning(f"获取缓存类型 {cache_type} 键数量失败: {e}")
+                    cache_counts[cache_type] = 0
+
             return {
                 "cache_counts": cache_counts,
                 "total_keys": sum(cache_counts.values()),
@@ -210,7 +228,7 @@ class UnifiedCacheService:
                 "base_prefix": self.base_prefix,
                 "stats": self.stats
             }
-            
+
         except Exception as e:
             logger.error(f"获取缓存统计失败: {e}")
             return {"error": str(e)}

@@ -174,7 +174,34 @@ class Config:
     @classmethod
     def get_bge_m3_dims(cls) -> int:
         return cls.get_env_or_default_int("BGE_M3_DIMS", 1024)
-    
+
+    # ==================== 搜索过滤配置 ====================
+
+    @classmethod
+    def get_search_max_question_length(cls) -> int:
+        """搜索时问题最大长度限制（字符数）"""
+        return cls.get_env_or_default_int("SEARCH_MAX_QUESTION_LENGTH", 500)
+
+    @classmethod
+    def get_search_max_answer_length(cls) -> int:
+        """搜索时答案最大长度限制（字符数）"""
+        return cls.get_env_or_default_int("SEARCH_MAX_ANSWER_LENGTH", 1000)
+
+    @classmethod
+    def get_search_max_results(cls) -> int:
+        """搜索结果最大数量限制"""
+        return cls.get_env_or_default_int("SEARCH_MAX_RESULTS", 20)
+
+    @classmethod
+    def get_search_max_query_length(cls) -> int:
+        """搜索查询最大长度限制（超过此长度不进行ES搜索）"""
+        return cls.get_env_or_default_int("SEARCH_MAX_QUERY_LENGTH", 1000)
+
+    @classmethod
+    def get_enable_cache_stats(cls) -> bool:
+        """是否启用缓存统计功能（避免使用KEYS命令）"""
+        return cls.get_env_or_default_bool("ENABLE_CACHE_STATS", False)
+
     # ==================== 事实管理配置 ====================
     
     @classmethod
@@ -426,7 +453,7 @@ class Config:
             "max_search_results": cls.get_env_or_default_int("SEARCH_MAX_RESULTS", 50),
             "redis_return_all_facts": cls.get_env_or_default_bool("SEARCH_REDIS_RETURN_ALL_FACTS", False),
             "fact_count_threshold": cls.get_env_or_default_int("SEARCH_FACT_COUNT_THRESHOLD", 50),  # 事实数量阈值
-            "recent_chats_limit": cls.get_env_or_default_int("SEARCH_RECENT_CHATS_LIMIT", 20),  # 最近对话轮数
+            "recent_chats_limit": cls.get_env_or_default_int("SEARCH_RECENT_CHATS_LIMIT", 10),  # 最近对话轮数
             
             # LLM搜索配置（当启用时使用）
             "llm_search_timeout": cls.get_env_or_default_int("SEARCH_LLM_TIMEOUT", 30),

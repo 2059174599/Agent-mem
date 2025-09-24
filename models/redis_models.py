@@ -252,7 +252,7 @@ class RedisService:
                     facts = facts[:max_results]
                     logger.info(f"限制结果数量为 {max_results} 条")
                 
-                logger.info(f"搜索事实: query='{query[:100]}', 返回 {len(facts)} 条事实")
+                logger.info(f"搜索事实: query='{query[:100]}...', 返回 {len(facts)} 条事实")
                 return facts
 
         except Exception as e:

@@ -160,7 +160,7 @@ class ESService:
                         },
                         "embedding": {
                             "type": "dense_vector",
-                            "dims": 1024  # BGE-M3模型的固定维度
+                            "dims": Config.get_bge_m3_dims()  # BGE-M3模型的维度配置
                         }
                     }
                 }
