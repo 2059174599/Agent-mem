@@ -112,7 +112,7 @@ class RedisService:
             predefined_topics = Config.get_predefined_topics()
             
             # 将预定义主题存储到Redis
-            await self.cache.set("temp", "predefined_topics", predefined_topics, 86400)  # 24小时过期
+            await self.cache.set("temp", "predefined_topics", predefined_topics)  # 永不过期
             
             logger.info(f"预定义主题已初始化: {len(predefined_topics)} 个主题")
             for topic, sub_topics in predefined_topics.items():
