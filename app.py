@@ -2,6 +2,7 @@
 FastAPI版本的记忆服务API
 性能优化版本，支持异步处理
 """
+from doctest import debug
 
 from dotenv import load_dotenv
 import os
@@ -98,7 +99,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Agent Memo API",
     description="智能记忆服务API",
-    version="2.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -393,7 +394,7 @@ async def manage_memory(request: MemoryManageRequest, current_user_id: str = Dep
             status_code=500
         )
 
-@app.get("/topics")
+@app.get("/topics", summary="获取预定义主题")
 async def get_topics(current_user_id: str = Depends(get_current_user_id)):
     """获取预定义主题"""
     try:
@@ -409,7 +410,7 @@ async def get_topics(current_user_id: str = Depends(get_current_user_id)):
             "error": str(e)
         }
 
-@app.get("/performance")
+@app.get("/performance", summary="获取性能统计")
 async def get_performance(current_user_id: str = Depends(get_current_user_id)):
     """获取性能统计"""
     await log_info("api", "📊 收到性能统计请求")
@@ -501,25 +502,6 @@ async def add_memory_batch(requests: list[AddMemoryRequest], current_user_id: st
             "message": "批量添加记忆失败"
         })
 
-@app.get('/topics', summary="获取预定义主题")
-async def get_topics_api(current_user_id: str = Depends(get_current_user_id)):
-    """获取预定义主题"""
-    return JSONResponse(content={
-        "success": True,
-        "topics": Config.get_predefined_topics()
-    })
-
-@app.get('/performance', summary="获取性能统计")
-async def get_performance_api(current_user_id: str = Depends(get_current_user_id)):
-    """获取性能统计信息"""
-    try:
-        await log_info("api", "📊 收到性能统计请求")
-        result = await async_memory_service.get_performance_stats()
-        await log_info("api", "✅ 返回性能统计成功")
-        return JSONResponse(content=result)
-    except Exception as e:
-        await log_error("api", f"❌ 获取性能统计失败: {e}")
-        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 
 @app.post('/cache/clear', summary="清理缓存")
 async def clear_cache_api(current_user_id: str = Depends(get_current_user_id)):

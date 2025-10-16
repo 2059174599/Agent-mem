@@ -125,7 +125,7 @@ class RedisService:
     def _get_facts_key(self, user_id: str, agent_id: Optional[str] = None) -> str:
         """获取事实存储的key - 使用统一前缀"""
         if agent_id:
-            return f"{user_id}:{agent_id}"
+            return f"yaxin_memo:facts:{user_id}:{agent_id}"
         return user_id
     
     async def add_fact(self, fact: FactDocument) -> bool:
@@ -645,18 +645,18 @@ class RedisService:
             logger.error(f"删除用户所有事实失败: {e}")
             return False
     
-    async def update_fact_by_chat_id(self, user_id: str, chat_id: str, 
+    async def update_fact_by_chat_id(self, user_id: str, old_chat_id: str, new_chat_id: str,
                                    new_memo: str, agent_id: Optional[str] = None,
                                    new_topic: Optional[str] = None, new_sub_topic: Optional[str] = None) -> bool:
         """根据chat_id更新事实的memo、topic和sub_topic"""
         try:
-            key = self._get_facts_key(user_id, agent_id)
-            facts = await self.cache.get_user_facts(key) or {}
+            # 使用统一的缓存服务获取事实
+            facts = await self.cache.get_user_facts(user_id, agent_id) or {}
             
             # 查找匹配chat_id的事实
             fact_to_update = None
             for fact_key, fact_data in facts.items():
-                if fact_data.get("chat_id") == chat_id:
+                if fact_data.get("chat_id") == old_chat_id:
                     fact_to_update = fact_key
                     break
             
@@ -690,14 +690,16 @@ class RedisService:
                     fact_to_update = new_fact_key
                 
                 # 更新时间戳
+                facts[fact_to_update]["chat_id"] = new_chat_id
                 facts[fact_to_update]["updated_at"] = datetime.now().isoformat()
                 facts[fact_to_update]["timestamp"] = facts[fact_to_update]["updated_at"]  # 保持兼容性
                 
-                await self.cache.set_user_facts(key, facts)
+                # 使用统一的缓存服务保存
+                await self.cache.set_user_facts(user_id, facts, agent_id)
                 logger.info(f"根据chat_id更新事实成功: {fact_to_update}")
                 return True
             else:
-                logger.warning(f"未找到chat_id为{chat_id}的事实")
+                logger.warning(f"未找到chat_id为{old_chat_id}的事实")
                 return False
         except Exception as e:
             logger.error(f"根据chat_id更新事实失败: {e}")
@@ -712,7 +714,25 @@ class RedisService:
         except Exception as e:
             logger.error(f"根据主题获取事实失败: {e}")
             return []
-    
+
+    async def get_facts_by_id(self, user_id: str, chatid: str,
+                          agent_id: Optional[str] = None) -> Optional[Dict]:
+        """根据chat_id获取事实 - 异步版本"""
+        try:
+            # 使用统一的缓存服务获取事实
+            facts = await self.cache.get_user_facts(user_id, agent_id) or {}
+            
+            for fact_key, fact_data in facts.items():
+                if fact_data.get("chat_id") == chatid:
+                    return fact_data
+            
+            # 未找到对应的chat_id
+            logger.warning(f"未找到chat_id={chatid}的事实，user_id={user_id}")
+            return None
+        except Exception as e:
+            logger.error(f"根据chat_id获取事实失败: {e}")
+            return None
+
     def get_facts_count(self, user_id: str, agent_id: Optional[str] = None) -> int:
         """获取用户事实数量"""
         try:

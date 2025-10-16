@@ -166,15 +166,7 @@ class ESService:
                 }
             }
             
-            # 先删除可能存在的索引
-            try:
-                if self.es.indices.exists(index=Config.get_es_chat_index()):
-                    self.es.indices.delete(index=Config.get_es_chat_index())
-                    logger.info(f"删除旧索引: {Config.get_es_chat_index()}")
-            except Exception as e:
-                logger.warning(f"删除旧索引失败: {e}")
-            
-            # 创建新索引
+            # 创建新索引（只有在索引不存在时才创建）
             self.es.indices.create(index=Config.get_es_chat_index(), body=mapping)
             logger.info(f"成功创建ES索引: {Config.get_es_chat_index()}")
             self.index_created = True
