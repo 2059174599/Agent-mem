@@ -68,9 +68,7 @@ class MemoryManagementService:
                 fact_ = await self.redis_service.get_facts_by_id(user_id, old_chat_id, agent_id)
                 if not fact_:
                     await log_error("memory_management", f"未找到chat_id={old_chat_id}的事实")
-                    # 使用默认问答
-                    question = f"用户更新事实为: {fact.memo}"
-                    answer = f"好的，用户已更新成功"
+                    raise Exception(f"未找到memoryId为:{old_chat_id}的记忆")
                 else:
                     question = f"用户更新事实:{fact_.get('memo', '')} 为 {fact.memo}"
                     answer = f"好的，用户已更新成功"
@@ -93,9 +91,7 @@ class MemoryManagementService:
                 fact_ = await self.redis_service.get_facts_by_id(user_id, old_chat_id, agent_id)
                 if not fact_:
                     await log_error("memory_management", f"未找到chat_id={old_chat_id}的事实")
-                    # 使用默认问答
-                    question = f"用户删除事实: chat_id={old_chat_id}"
-                    answer = f"好的，用户删除事实成功"
+                    raise Exception(f"未找到memoryId为:{old_chat_id}的记忆")
                 else:
                     question = f"用户删除事实:{fact_.get('memo', '')}"
                     answer = f"好的，用户删除事实成功"
@@ -167,7 +163,7 @@ class MemoryManagementService:
         
         # 如果提供了topic，验证是否在预定义列表中
         if topic and topic not in predefined_topics:
-            return False, f"主题 '{topic}' 不在预定义列表中"
+            return False, f"主题 '{topic}' 不在预定义主题列表中"
         
         # 如果提供了subTopic，需要同时提供topic并验证
         if sub_topic:
