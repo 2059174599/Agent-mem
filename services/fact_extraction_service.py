@@ -21,6 +21,16 @@ from prompts.fact_extraction import (
     MEMORY_UPDATE_DECISION_PROMPT
 )
 
+# 延迟导入压缩服务(避免循环依赖)
+_compression_service = None
+
+def get_compression_service():
+    global _compression_service
+    if _compression_service is None:
+        from services.content_compression_service import content_compression_service
+        _compression_service = content_compression_service
+    return _compression_service
+
 class FactExtractionService:
     """事实提取服务 - 两阶段事实提取"""
     
@@ -157,14 +167,30 @@ class FactExtractionService:
                 )
                 
                 if action_result["action"] == "add":
-                    # 添加新事实
+                    # 添加新事实 - 集成自动压缩
+                    memo = new_fact["memo"]
+                    
+                    # 检查是否需要压缩
+                    if Config.get_compression_enabled():
+                        compression_service = get_compression_service()
+                        if compression_service.should_compress(new_fact["topic"], memo):
+                            await log_info("fact_extraction", f"🗜️ 内容过长，自动压缩: {len(memo)}字符")
+                            compress_result = await compression_service.compress_content(
+                                new_fact["topic"], 
+                                new_fact["sub_topic"], 
+                                memo
+                            )
+                            memo = compress_result["compressed"]
+                            await log_info("fact_extraction", 
+                                f"✅ 压缩完成: {compress_result['original_length']}→{compress_result['compressed_length']}字符")
+                    
                     fact_doc = FactDocument(
                         user_id=user_id,
                         agent_id=agent_id,
                         topic=new_fact["topic"],
                         sub_topic=new_fact["sub_topic"],
-                        memo=new_fact["memo"],
-                        chat_id=chat_id,  # 使用传入的chat_id
+                        memo=memo,  # 使用压缩后的内容
+                        chat_id=chat_id,
                         created_at=datetime.now(),
                         updated_at=datetime.now()
                     )
@@ -188,9 +214,23 @@ class FactExtractionService:
                         await log_error("fact_extraction", f"❌ 添加事实失败: {new_fact['topic']} - {new_fact['sub_topic']}")
                 
                 elif action_result["action"] == "update":
-                    # 更新或合并现有事实
+                    # 更新或合并现有事实 - 集成自动压缩
                     existing_fact = action_result["existing_fact"]
                     updated_memo = action_result["updated_memo"]
+                    
+                    # 检查是否需要压缩
+                    if Config.get_compression_enabled():
+                        compression_service = get_compression_service()
+                        if compression_service.should_compress(new_fact["topic"], updated_memo):
+                            await log_info("fact_extraction", f"🗜️ 合并后内容过长，自动压缩: {len(updated_memo)}字符")
+                            compress_result = await compression_service.compress_content(
+                                new_fact["topic"], 
+                                new_fact["sub_topic"], 
+                                updated_memo
+                            )
+                            updated_memo = compress_result["compressed"]
+                            await log_info("fact_extraction", 
+                                f"✅ 压缩完成: {compress_result['original_length']}→{compress_result['compressed_length']}字符")
                     
                     # 更新Redis中的事实
                     success = await self.redis_service.update_fact(

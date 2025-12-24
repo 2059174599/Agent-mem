@@ -23,9 +23,20 @@ from services.async_memory_service_v2 import AsyncMemoryServiceV2
 from services.unified_cache_service import unified_cache_service
 from services.async_logging_service import async_logging_service, log_info, log_error
 from services.memory_management_service import MemoryManagementService
-from middleware.simple_auth import SimpleAuthMiddleware, get_current_user_id, get_auth_status
+from middleware.simple_auth import SimpleAuthMiddleware, get_current_user_id, get_auth_status, get_scenario_token, get_scenario_config
 from config import Config
+from config_scenarios import ScenarioConfig
 from logging_config import setup_logging, get_logger
+
+# ARQ相关导入
+try:
+    from arq import create_pool
+    from arq.connections import ArqRedis
+    ARQ_AVAILABLE = True
+except ImportError:
+    ARQ_AVAILABLE = False
+    logger = get_logger(__name__)
+    logger.warning("⚠️ ARQ未安装，持久化任务将无法运行。请安装: pip install arq")
 
 # 设置统一日志配置
 setup_logging()
@@ -34,6 +45,7 @@ logger = get_logger(__name__)
 # 全局异步服务实例
 async_memory_service = None
 memory_management_service = None
+arq_pool: Optional[ArqRedis] = None  # ARQ连接池
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,6 +53,7 @@ async def lifespan(app: FastAPI):
     global async_memory_service
     
     # 启动事件
+    global async_memory_service, memory_management_service, arq_pool
     logger.info("🚀 开始启动FastAPI记忆服务...")
     
     try:
@@ -74,11 +87,33 @@ async def lifespan(app: FastAPI):
             logger.warning(f"⚠️ 预定义主题配置失败: {e}")
         
         # 初始化记忆管理服务
-        global memory_management_service
         memory_management_service = MemoryManagementService(
             async_memory_service.redis_service,
             unified_cache_service
         )
+        
+        # 初始化ARQ连接池（用于提交任务）
+        if ARQ_AVAILABLE and Config.get_persistence_enabled():
+            try:
+                from arq.connections import RedisSettings
+                arq_pool = await create_pool(
+                    RedisSettings(
+                        host=Config.get_redis_host(),
+                        port=Config.get_redis_port(),
+                        password=Config.get_redis_password() if Config.get_redis_password() else None,
+                        database=Config.get_redis_db(),
+                    )
+                )
+                logger.info("✅ ARQ连接池已初始化，持久化任务将由ARQ Worker处理")
+                logger.info(f"   请确保ARQ Worker已启动: arq services.arq_tasks.WorkerSettings")
+            except Exception as e:
+                logger.warning(f"⚠️ ARQ连接池初始化失败: {e}")
+                logger.warning("   持久化任务将无法运行，请检查Redis连接和ARQ Worker")
+        else:
+            if not ARQ_AVAILABLE:
+                logger.warning("⚠️ ARQ未安装，持久化功能不可用")
+            elif not Config.get_persistence_enabled():
+                logger.info("ℹ️ 持久化功能已禁用")
         
         logger.info("🎉 FastAPI记忆服务启动完成！")
         logger.info(f"📊 服务配置: 端口={Config.get_app_port()}, 日志级别={Config.get_log_level()}")
@@ -91,6 +126,12 @@ async def lifespan(app: FastAPI):
     
     # 关闭事件
     logger.info("🛑 开始关闭FastAPI记忆服务...")
+    
+    # 关闭ARQ连接池
+    if arq_pool:
+        await arq_pool.close()
+        logger.info("✅ ARQ连接池已关闭")
+    
     if async_memory_service:
         await async_memory_service.__aexit__(None, None, None)
     logger.info("FastAPI记忆服务关闭完成")
@@ -395,16 +436,70 @@ async def manage_memory(request: MemoryManageRequest, current_user_id: str = Dep
         )
 
 @app.get("/topics", summary="获取预定义主题")
-async def get_topics(current_user_id: str = Depends(get_current_user_id)):
-    """获取预定义主题"""
+async def get_topics(request: Request, current_user_id: str = Depends(get_current_user_id)):
+    """获取预定义主题 - 根据当前场景返回对应的主题"""
     try:
-        topics = await memory_management_service.get_predefined_topics()
+        # 获取当前场景的token
+        scenario_token = get_scenario_token(request)
+        
+        # 获取场景对应的主题配置
+        topics = ScenarioConfig.get_scenario_topics(scenario_token)
+        
+        await log_info("api", f"📋 获取主题成功: 场景={scenario_token}, 主题数={len(topics)}")
+        
         return {
             "success": True,
+            "scenario": scenario_token,
             "topics": topics
         }
     except Exception as e:
         await log_error("api", f"❌ 获取主题失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/scenarios", summary="获取所有场景配置")
+async def get_scenarios():
+    """获取所有可用场景配置(不需要鉴权)"""
+    try:
+        scenarios = ScenarioConfig.get_all_scenarios()
+        return {
+            "success": True,
+            "scenarios": scenarios,
+            "total": len(scenarios)
+        }
+    except Exception as e:
+        await log_error("api", f"❌ 获取场景配置失败: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@app.get("/scenario/current", summary="获取当前场景信息")
+async def get_current_scenario(request: Request, current_user_id: str = Depends(get_current_user_id)):
+    """获取当前请求的场景信息"""
+    try:
+        scenario_token = get_scenario_token(request)
+        scenario_config = get_scenario_config(request)
+        
+        if scenario_config:
+            return {
+                "success": True,
+                "token": scenario_token,
+                "name": scenario_config.get("name", "未知"),
+                "description": scenario_config.get("description", ""),
+                "fact_extraction_strategy": scenario_config.get("fact_extraction_strategy", {})
+            }
+        else:
+            return {
+                "success": False,
+                "error": "未找到场景配置"
+            }
+    except Exception as e:
+        await log_error("api", f"❌ 获取当前场景失败: {e}")
         return {
             "success": False,
             "error": str(e)
@@ -624,6 +719,153 @@ async def get_cache_stats_api(current_user_id: str = Depends(get_current_user_id
     except Exception as e:
         await log_error("api", f"❌ 获取缓存统计失败: {e}")
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+
+# ==================== 数据恢复接口 ====================
+
+class RestoreRequest(BaseModel):
+    """数据恢复请求模型"""
+    userId: Optional[str] = None  # 可选，不传则恢复所有用户
+    agentId: Optional[str] = None
+
+@app.post("/memory/restore", summary="从持久化存储恢复记忆到Redis")
+async def restore_memory_from_persistence(
+    request: RestoreRequest,
+    current_user_id: str = Depends(get_current_user_id)
+):
+    """
+    从持久化存储恢复记忆数据到Redis
+    - 如果指定 userId，只恢复该用户的记忆
+    - 如果不指定 userId，恢复所有用户的记忆
+    """
+    try:
+        from services.persistence_service import get_persistence_backend
+        from models.redis_models import FactDocument
+        from pathlib import Path
+        
+        backend = get_persistence_backend()
+        backend_type = Config.get_persistence_backend()
+        
+        # 如果指定了 userId，只恢复该用户
+        if request.userId:
+            await log_info("api", f"🔄 恢复单个用户: user_id={request.userId}, agent_id={request.agentId}")
+            
+            facts_list = await backend.load_facts(request.userId, request.agentId)
+            
+            if not facts_list:
+                return {
+                    "success": False,
+                    "message": "未找到持久化数据",
+                    "user_id": request.userId,
+                    "restored_count": 0
+                }
+            
+            restored_count = 0
+            for fact_dict in facts_list:
+                try:
+                    # 使用 from_dict 方法自动处理时间字段转换
+                    fact_doc = FactDocument.from_dict(fact_dict)
+                    
+                    if await async_memory_service.redis_service.add_fact(fact_doc):
+                        restored_count += 1
+                except Exception as e:
+                    await log_error("api", f"恢复单条记忆失败: {e}")
+            
+            await log_info("api", f"✅ 单个用户恢复完成: {restored_count}条")
+            
+            return {
+                "success": True,
+                "message": "数据恢复完成",
+                "user_id": request.userId,
+                "agent_id": request.agentId,
+                "restored_count": restored_count,
+                "total": len(facts_list)
+            }
+        
+        # 如果未指定 userId，恢复所有用户
+        else:
+            await log_info("api", "🔄 恢复所有用户的记忆数据")
+            
+            restored_users = []
+            failed_users = []
+            total_restored = 0
+            
+            if backend_type == "file":
+                # 扫描持久化文件目录
+                data_dir = Path(Config.get_persistence_data_dir())
+                if not data_dir.exists():
+                    return {
+                        "success": False,
+                        "message": f"持久化目录不存在: {data_dir}",
+                        "restored_users": 0
+                    }
+                
+                # 查找所有 *_facts.json 文件
+                for file_path in data_dir.glob("*_facts.json"):
+                    try:
+                        # 解析文件名获取 user_id 和 agent_id
+                        filename = file_path.stem.replace("_facts", "")
+                        
+                        # 简单策略：如果文件名包含两个部分且最后部分不像email，认为最后部分是 agent_id
+                        parts = filename.rsplit("_", 1)
+                        if len(parts) == 2 and "@" not in parts[1] and "." not in parts[1]:
+                            user_id = parts[0]
+                            agent_id = parts[1]
+                        else:
+                            user_id = filename
+                            agent_id = None
+                        
+                        # 恢复这个用户的数据
+                        facts_list = await backend.load_facts(user_id, agent_id)
+                        
+                        if facts_list:
+                            user_restored = 0
+                            
+                            for fact_dict in facts_list:
+                                try:
+                                    # 使用 from_dict 方法自动处理时间字段转换
+                                    fact_doc = FactDocument.from_dict(fact_dict)
+                                    
+                                    if await async_memory_service.redis_service.add_fact(fact_doc):
+                                        user_restored += 1
+                                except Exception as e:
+                                    await log_error("api", f"恢复失败: {user_id}/{agent_id} - {e}")
+                                    pass
+                            
+                            if user_restored > 0:
+                                restored_users.append({
+                                    "user_id": user_id,
+                                    "agent_id": agent_id,
+                                    "count": user_restored
+                                })
+                                total_restored += user_restored
+                                await log_info("api", f"  ✅ {user_id}: {user_restored}条")
+                        
+                    except Exception as e:
+                        await log_error("api", f"恢复文件失败 {file_path}: {e}")
+                        failed_users.append(str(file_path.name))
+            
+            elif backend_type == "es":
+                return {
+                    "success": False,
+                    "message": "ES批量恢复功能待实现，请使用文件后端或指定userId逐个恢复"
+                }
+            
+            await log_info("api", f"✅ 批量恢复完成: {len(restored_users)}个用户, 共{total_restored}条记忆")
+            
+            return {
+                "success": True,
+                "message": "批量数据恢复完成",
+                "restored_users_count": len(restored_users),
+                "total_restored_facts": total_restored,
+                "failed_users_count": len(failed_users),
+                "details": restored_users[:20]  # 返回前20个用户的详情
+            }
+        
+    except Exception as e:
+        await log_error("api", f"❌ 数据恢复失败: {e}")
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
 
 if __name__ == "__main__":
     import uvicorn

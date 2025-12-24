@@ -1,5 +1,6 @@
 import redis
 import json
+import asyncio
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from config import Config
@@ -9,6 +10,16 @@ from services.llm_service import llm_service
 from prompts.fact_extraction import FACT_SEARCH_FILTER_PROMPT, FACT_SEARCH_FILTER_USER_PROMPT
 
 logger = get_logger(__name__)
+
+# 延迟导入持久化服务(避免循环导入)
+_persistence_service = None
+
+def get_persistence_service():
+    global _persistence_service
+    if _persistence_service is None:
+        from services.persistence_service import get_persistence_backend
+        _persistence_service = get_persistence_backend()
+    return _persistence_service
 
 class FactDocument:
     """事实文档模型"""
@@ -129,7 +140,7 @@ class RedisService:
         return user_id
     
     async def add_fact(self, fact: FactDocument) -> bool:
-        """添加事实 - 使用统一缓存服务"""
+        """添加事实 - 使用统一缓存服务 + 自动持久化"""
         try:
             key = self._get_facts_key(fact.user_id, fact.agent_id)
             sub_topic_key = f"{fact.topic}:{fact.sub_topic}"
@@ -145,6 +156,10 @@ class RedisService:
 
             if success:
                 logger.info(f"添加事实: key={key}, sub_topic={sub_topic_key}")
+                
+                # 自动持久化到文件(异步,不阻塞主流程)
+                asyncio.create_task(self._auto_persist_facts(fact.user_id, fact.agent_id, existing_facts))
+                
                 return True
             else:
                 logger.error(f"添加事实失败: 缓存保存失败")
@@ -155,12 +170,22 @@ class RedisService:
             return False
 
     async def get_facts(self, user_id: str, agent_id: Optional[str] = None) -> List[FactDocument]:
-        """获取用户的所有事实 - 使用统一缓存服务"""
+        """获取用户的所有事实 - 使用统一缓存服务 + 自动从持久化恢复"""
         try:
             logger.info(f'获取事实: user_id={user_id}, agent_id={agent_id}')
 
             # 从统一缓存获取事实数据
             facts_data = await self.cache.get_user_facts(user_id, agent_id) or {}
+
+            # 如果Redis中没有数据,尝试从持久化存储加载
+            if not facts_data:
+                logger.info(f'Redis中无数据,尝试从持久化存储加载: user_id={user_id}, agent_id={agent_id}')
+                facts_data = await self._load_from_persistence(user_id, agent_id)
+                
+                # 如果从持久化加载成功,写回Redis
+                if facts_data:
+                    await self.cache.set_user_facts(user_id, facts_data, agent_id)
+                    logger.info(f'✅ 从持久化恢复事实到Redis: user_id={user_id}, count={len(facts_data)}')
 
             facts = []
             for sub_topic_key, fact_data in facts_data.items():
@@ -793,3 +818,40 @@ class RedisService:
         except Exception as e:
             logger.error(f"LLM智能过滤失败: {e}")
             return facts
+    
+    async def _auto_persist_facts(self, user_id: str, agent_id: Optional[str], facts_data: Dict):
+        """自动持久化事实(异步执行,不阻塞主流程)"""
+        try:
+            persistence = get_persistence_service()
+            
+            # 转换为列表格式
+            facts_list = list(facts_data.values())
+            
+            success = await persistence.save_facts(user_id, agent_id, facts_list)
+            if success:
+                logger.info(f"✅ 自动持久化成功: user_id={user_id}, agent_id={agent_id}, facts={len(facts_list)}")
+            else:
+                logger.warning(f"⚠️ 自动持久化失败: user_id={user_id}, agent_id={agent_id}")
+                
+        except Exception as e:
+            logger.error(f"❌ 自动持久化异常: {e}")
+    
+    async def _load_from_persistence(self, user_id: str, agent_id: Optional[str]) -> Dict:
+        """从持久化存储加载事实"""
+        try:
+            persistence = get_persistence_service()
+            facts_list = await persistence.load_facts(user_id, agent_id)
+            
+            # 转换为字典格式
+            facts_data = {}
+            for fact_dict in facts_list:
+                topic = fact_dict.get("topic", "")
+                sub_topic = fact_dict.get("sub_topic", "")
+                key = f"{topic}:{sub_topic}"
+                facts_data[key] = fact_dict
+            
+            return facts_data
+            
+        except Exception as e:
+            logger.error(f"从持久化加载失败: {e}")
+            return {}

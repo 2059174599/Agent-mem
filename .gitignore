@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+ENV/
+.*/  # 隐藏目录，但要注意 .gitignore 本身除外
+
+# 环境变量
+.env
+.myenv/
+
+# 日志
+logs/
+
+# 依赖
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+pip-log.txt
+pip-delete-this-directory.txt
+
+# 其他
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

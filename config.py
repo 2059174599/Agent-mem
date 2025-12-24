@@ -638,3 +638,47 @@ class Config:
         print(f"调试模式: {cls.get_debug()}")
         print(f"日志级别: {cls.get_log_level()}")
         print("==========================")
+    
+    # ==================== 内容压缩配置 ====================
+    
+    @classmethod
+    def get_compression_enabled(cls) -> bool:
+        """是否启用自动内容压缩"""
+        return cls.get_env_or_default_bool("COMPRESSION_ENABLED", True)
+    
+    @classmethod
+    def get_compression_tech_threshold(cls) -> int:
+        """技术类内容压缩阈值（字符数）"""
+        return cls.get_env_or_default_int("COMPRESSION_TECH_THRESHOLD", 200)
+    
+    @classmethod
+    def get_compression_general_threshold(cls) -> int:
+        """通用类内容压缩阈值（字符数）"""
+        return cls.get_env_or_default_int("COMPRESSION_GENERAL_THRESHOLD", 300)
+    
+    # ==================== 持久化配置 ====================
+    
+    @classmethod
+    def get_persistence_enabled(cls) -> bool:
+        """是否启用持久化"""
+        return cls.get_env_or_default_bool("PERSISTENCE_ENABLED", True)
+    
+    @classmethod
+    def get_persistence_backend(cls) -> str:
+        """持久化后端类型: es 或 file"""
+        return cls.get_env_or_default("PERSISTENCE_BACKEND", "file")
+    
+    @classmethod
+    def get_persistence_interval(cls) -> int:
+        """持久化间隔（秒），0表示每次修改后立即持久化"""
+        return cls.get_env_or_default_int("PERSISTENCE_INTERVAL", 3600)  # 默认1小时
+    
+    @classmethod
+    def get_persistence_data_dir(cls) -> str:
+        """持久化文件存储目录"""
+        return cls.get_env_or_default("PERSISTENCE_DATA_DIR", "data/persistence")
+    
+    @classmethod
+    def get_persistence_es_index(cls) -> str:
+        """持久化ES索引名称"""
+        return cls.get_env_or_default("PERSISTENCE_ES_INDEX", "user_memory_facts")

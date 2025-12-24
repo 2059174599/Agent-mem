@@ -1,5 +1,5 @@
 """
-简单鉴权中间件 - 基于Header验证
+简单鉴权中间件 - 基于Header验证，支持多场景
 """
 
 from fastapi import Request, HTTPException, status
@@ -13,22 +13,23 @@ logger = get_logger(__name__)
 
 
 class SimpleAuthMiddleware(BaseHTTPMiddleware):
-    """简单鉴权中间件 - 基于Header验证"""
+    """简单鉴权中间件 - 基于Header验证，支持多场景token"""
     
     def __init__(self, app, auth_token: str = "yixinagentmemory", excluded_paths: List[str] = None):
         super().__init__(app)
-        self.auth_token = auth_token
+        self.auth_token = auth_token  # 保留用于向后兼容
         self.excluded_paths = excluded_paths or [
             "/health",
             "/docs",
             "/redoc",
             "/openapi.json",
             "/auth/login",
-            "/auth/register"
+            "/auth/register",
+            "/scenarios"  # 新增: 场景列表接口
         ]
     
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """处理请求"""
+        """处理请求 - 支持多场景token验证"""
         try:
             # 检查是否在排除路径中
             if self._is_excluded_path(request.url.path):
@@ -45,13 +46,24 @@ class SimpleAuthMiddleware(BaseHTTPMiddleware):
             
             token = auth_header[7:]  # 移除 "Bearer " 前缀
             
-            # 验证Token
-            if token != self.auth_token:
-                return self._create_auth_error_response("无效的认证Token")
+            # 验证Token - 支持多场景
+            from config_scenarios import ScenarioConfig
             
-            # 将用户信息添加到请求状态（简化版）
+            # 检查是否为有效的场景token
+            if not ScenarioConfig.is_valid_token(token):
+                # 向后兼容: 检查是否为旧的默认token
+                if token != self.auth_token:
+                    return self._create_auth_error_response("无效的认证Token")
+            
+            # 将场景信息添加到请求状态
             request.state.user_id = "authenticated_user"
             request.state.is_authenticated = True
+            request.state.scenario_token = token  # 存储场景token
+            request.state.scenario_config = ScenarioConfig.get_scenario_config(token)
+            
+            # 记录场景信息
+            scenario_name = request.state.scenario_config.get("name", "未知场景") if request.state.scenario_config else "通用场景"
+            logger.info(f"请求场景: {scenario_name} (token: {token[:10]}...)")
             
             # 继续处理请求
             response = await call_next(request)
@@ -94,3 +106,13 @@ def get_current_user_id(request: Request) -> str:
 def get_auth_status(request: Request) -> bool:
     """获取认证状态"""
     return getattr(request.state, 'is_authenticated', False)
+
+
+def get_scenario_token(request: Request) -> str:
+    """获取当前请求的场景token"""
+    return getattr(request.state, 'scenario_token', 'yixinagentmemory')
+
+
+def get_scenario_config(request: Request) -> dict:
+    """获取当前请求的场景配置"""
+    return getattr(request.state, 'scenario_config', None)
