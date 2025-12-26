@@ -204,6 +204,40 @@ class Config:
 
     # ==================== 事实管理配置 ====================
     
+    # ==================== 滑动窗口与混合检索配置 ====================
+    
+    @classmethod
+    def get_sliding_window_size(cls) -> int:
+        """获取滑动窗口大小（最近N轮对话作为上下文）"""
+        return cls.get_env_or_default_int("SLIDING_WINDOW_SIZE", 5)
+    
+    @classmethod
+    def get_max_cached_conversations(cls) -> int:
+        """获取Redis缓存的最大对话数"""
+        return cls.get_env_or_default_int("MAX_CACHED_CONVERSATIONS", 20)
+    
+    @classmethod
+    def get_enable_graph_search(cls) -> bool:
+        """是否启用图谱检索（只在事实数>100时生效）"""
+        return cls.get_env_or_default_bool("ENABLE_GRAPH_SEARCH", False)
+    
+    @classmethod
+    def get_graph_similarity_threshold(cls) -> float:
+        """图谱关系建立的相似度阈值（0.0-1.0）"""
+        return cls.get_env_or_default_float("GRAPH_SIMILARITY_THRESHOLD", 0.7)
+    
+    @classmethod
+    def get_max_relations_per_fact(cls) -> int:
+        """每个事实最多保留的关系数量"""
+        return cls.get_env_or_default_int("MAX_RELATIONS_PER_FACT", 5)
+    
+    @classmethod
+    def get_time_decay_factor(cls) -> float:
+        """时序衰减因子（越大衰减越快）"""
+        return cls.get_env_or_default_float("TIME_DECAY_FACTOR", 0.03)
+    
+    # ==================== 预定义主题配置 ====================
+    
     @classmethod
     def get_predefined_topics(cls) -> Dict[str, List[str]]:
         """获取预定义主题和子主题"""

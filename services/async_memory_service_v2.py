@@ -18,6 +18,10 @@ from services.async_logging_service import async_logging_service, log_info, log_
 from services.llm_service import llm_service
 from services.embedding_service import embedding_service
 from services.fact_extraction_service import fact_extraction_service
+from services.conversation_cache_service import conversation_cache_service
+from services.sliding_window_extractor import sliding_window_extractor
+from services.lightweight_hybrid_search import lightweight_hybrid_search
+from services.redis_light_graph import redis_light_graph
 from config import Config
 from logging_config import get_logger
 
@@ -133,6 +137,15 @@ class AsyncMemoryServiceV2:
             
             await log_info("es", f"✅ 对话已存储到ES: chat_id={chat_id}")
             
+            # 添加到对话缓存（Redis）
+            await conversation_cache_service.add_conversation(
+                user_id=user_id,
+                agent_id=agent_id,
+                question=question,
+                answer=answer,
+                chat_id=chat_id
+            )
+            
             # 处理embedding（如果ES存储时没有获取到）
             if not question_embedding:
                 await log_info("es", f"🔄 更新ES记录embedding: chat_id={chat_id}")
@@ -140,31 +153,46 @@ class AsyncMemoryServiceV2:
                 if question_embedding:
                     self.es_service.update_chat_embedding(chat_id, question_embedding)
             
-            # 使用两阶段事实提取服务
-            await log_info("fact_processing", f"🔍 开始两阶段事实提取: question={question[:50]}...")
+            # 【第一阶段】使用滑动窗口事实提取（带上下文）
+            await log_info("fact_processing", f"🔍 第一阶段：滑动窗口事实提取: question={question[:50]}...")
             
-            fact_result = await fact_extraction_service.extract_facts_two_stage(
-                user_id, agent_id, question, answer, chat_id
+            extraction_result = await sliding_window_extractor.extract_facts_with_context(
+                user_id=user_id,
+                agent_id=agent_id,
+                current_question=question,
+                current_answer=answer,
+                es_service=self.es_service
             )
             
             facts_added = []
-            if fact_result.get("success", False):
-                stage1_facts = fact_result.get("stage1_facts", [])
-                stage2_actions = fact_result.get("stage2_actions", [])
-                final_facts = fact_result.get("final_facts", [])
+            if extraction_result.get("success", False) and extraction_result.get("contains_facts", False):
+                # 提取到的事实
+                stage1_facts = extraction_result.get("facts", [])
+                await log_info("fact_processing", f"✅ 第一阶段提取到 {len(stage1_facts)} 个事实")
+                
+                # 【第二阶段】与现有事实对比并决定操作（add/update/skip）
+                await log_info("fact_processing", f"🔄 第二阶段：对比现有事实并决定操作")
+                
+                stage2_result = await fact_extraction_service._compare_and_update_facts(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    new_facts=stage1_facts,
+                    question=question,
+                    answer=answer,
+                    chat_id=chat_id
+                )
+                
+                # 获取第二阶段的操作结果
+                actions = stage2_result.get("actions", [])
+                final_facts = stage2_result.get("final_facts", [])
                 
                 await log_info("fact_processing", f"✅ 两阶段事实提取完成:")
                 await log_info("fact_processing", f"  📋 第一阶段提取: {len(stage1_facts)} 个事实")
-                await log_info("fact_processing", f"  🔄 第二阶段操作: {len(stage2_actions)} 个操作")
+                await log_info("fact_processing", f"  🔄 第二阶段操作: {len(actions)} 个操作")
                 await log_info("fact_processing", f"  📝 最终结果: {len(final_facts)} 个事实")
                 
-                # 为最终事实设置chat_id
-                for fact_info in final_facts:
-                    fact_info["chat_id"] = chat_id
-                    facts_added.append(fact_info)
-                
                 # 记录详细的操作日志
-                for i, action in enumerate(stage2_actions):
+                for i, action in enumerate(actions):
                     action_type = action.get("action", "unknown")
                     if action_type == "add":
                         await log_info("fact_processing", f"  ✅ 操作 {i+1}: 添加事实 - {action.get('fact', {}).get('topic', 'N/A')}")
@@ -172,8 +200,17 @@ class AsyncMemoryServiceV2:
                         await log_info("fact_processing", f"  🔄 操作 {i+1}: 更新事实 - {action.get('new_fact', {}).get('topic', 'N/A')}")
                     elif action_type == "skip":
                         await log_info("fact_processing", f"  ⏭️ 操作 {i+1}: 跳过事实 - {action.get('fact', {}).get('topic', 'N/A')} (原因: {action.get('reason', '未知')})")
+                
+                # 为最终事实建立图谱关系（可选）
+                if final_facts and Config.get_enable_graph_search():
+                    await self._build_graph_relations(user_id, agent_id, final_facts)
+                
+                # 为最终事实设置chat_id
+                for fact_info in final_facts:
+                    fact_info["chat_id"] = chat_id
+                    facts_added.append(fact_info)
             else:
-                await log_info("fact_processing", f"ℹ️ 两阶段事实提取未成功: {fact_result.get('message', '未知原因')}")
+                await log_info("fact_processing", f"ℹ️ 第一阶段未提取到事实: {extraction_result.get('reason', '未知原因')}")
             
             total_time = time.time() - start_time
             self.stats["avg_response_time"] = (
@@ -217,6 +254,32 @@ class AsyncMemoryServiceV2:
                 "error": str(e),
                 "processing_time": total_time
             }
+    
+    async def _build_graph_relations(
+        self,
+        user_id: str,
+        agent_id: Optional[str],
+        facts: List[Dict]
+    ) -> None:
+        """为新事实建立图谱关系（异步后台任务）"""
+        try:
+            for fact_info in facts:
+                fact_id = f"{fact_info['topic']}:{fact_info['sub_topic']}"
+                fact_memo = fact_info.get("memo", "")
+                
+                # 异步建立关系，不阻塞主流程
+                await redis_light_graph.build_relations_for_fact(
+                    redis_client=self.redis_service.redis,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    new_fact_id=fact_id,
+                    new_fact_memo=fact_memo,
+                    new_fact_topic=fact_info["topic"],
+                    new_fact_sub_topic=fact_info["sub_topic"],
+                    new_fact_embedding=fact_info.get("embedding")
+                )
+        except Exception as e:
+            await log_error("graph", f"❌ 建立图谱关系失败: {e}")
     
     async def _store_chat_to_es(self, user_id: str, agent_id: Optional[str], 
                                question: str, answer: str) -> Optional[str]:
@@ -545,15 +608,28 @@ class AsyncMemoryServiceV2:
     
     async def _search_facts_async(self, user_id: str, query: str, 
                                  agent_id: Optional[str], limit: int) -> Dict:
-        """异步搜索事实"""
+        """异步搜索事实 - 使用轻量级混合检索"""
         try:
-            facts = await self.redis_service.search_facts(user_id, query, agent_id)
+            # 使用轻量级混合检索
+            facts_results = await lightweight_hybrid_search.search(
+                redis_service=self.redis_service,
+                user_id=user_id,
+                agent_id=agent_id,
+                query=query,
+                max_results=limit
+            )
             
-            # 转换为字典格式 - 统一使用简化格式
+            # 转换为简化格式
             facts_dict = []
-            for fact in facts[:limit]:
-                fact_dict = fact.to_simple_dict()
-                facts_dict.append(fact_dict)
+            for result in facts_results:
+                facts_dict.append({
+                    "topic": result.get("topic"),
+                    "sub_topic": result.get("sub_topic"),
+                    "memo": result.get("memo"),
+                    "updated_at": result.get("updated_at"),
+                    "score": result.get("score"),  # 包含混合分数
+                    "search_strategy": result.get("search_strategy")  # 使用的检索策略
+                })
             
             return {
                 "success": True,
@@ -656,32 +732,26 @@ class AsyncMemoryServiceV2:
     
     async def _get_recent_chats_async(self, user_id: str, agent_id: Optional[str], 
                                     limit: int = 20) -> Dict:
-        """获取最近N轮对话 - 带超时处理"""
+        """获取最近N轮对话 - 优先从Redis缓存读取"""
         try:
             await log_info("recent_chats", f"获取最近{limit}轮对话: user_id={user_id}")
             
-            # 设置ES查询超时时间（秒）
-            es_timeout = Config.get_search_strategies().get("es_search_timeout", 10)
-            
-            # 从ES获取最近对话
-            recent_chats = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None,
-                    self.es_service.get_recent_chats,
-                    user_id, agent_id, limit
-                ),
-                timeout=es_timeout
+            # 优先从Redis缓存获取
+            conversations = await conversation_cache_service.get_recent_conversations(
+                user_id=user_id,
+                agent_id=agent_id,
+                limit=limit,
+                es_service=self.es_service
             )
             
             # 格式化结果
             chats_formatted = []
-            for chat in recent_chats:
+            for conv in conversations:
                 chats_formatted.append({
-                    "question": chat["question"],
-                    "answer": chat["answer"],
-                    "timestamp": chat["timestamp"],
-                    "chat_id": chat.get("chat_id", ""),
-                    # "topics": chat.get("topics", [])
+                    "question": conv["question"],
+                    "answer": conv["answer"],
+                    "timestamp": conv["timestamp"],
+                    "chat_id": conv.get("chat_id", "")
                 })
             
             await log_info("recent_chats", f"获取到{len(chats_formatted)}个最近对话")
@@ -691,9 +761,6 @@ class AsyncMemoryServiceV2:
                 "chats": chats_formatted
             }
             
-        except asyncio.TimeoutError:
-            await log_warning("recent_chats", f"ES查询超时 ({es_timeout}秒)，返回空结果")
-            return {"success": False, "chats": [], "error": "ES查询超时"}
         except Exception as e:
             await log_error("recent_chats", f"获取最近对话失败: {e}")
             return {"success": False, "chats": [], "error": str(e)}
