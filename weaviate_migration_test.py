@@ -21,6 +21,7 @@ import time
 import json
 import os
 import hashlib
+import sys
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -50,7 +51,7 @@ SOURCE_CONFIG = {
 # 目标Weaviate配置 - 生产
 TARGET_CONFIG = {
     "endpoint": "http://weaviate2202.8081-wm.db.idc:8081",  # 修改为目标地址
-    "api_key": "mkjkGiy9yaiT"  # 修改为目标API Key
+    "api_key": "xbph0bs=mkjkGiy9yaiT"  # 修改为目标API Key
 }
 
 # 迁移配置
@@ -319,6 +320,15 @@ class WeaviateMigrator:
         self.state_manager = MigrationState(state_file)
         self.notifier = WeComNotifier(wecom_webhook)
 
+    def _tqdm_kwargs(self) -> Dict[str, Any]:
+        """统一进度条输出，避免和日志相互污染"""
+        return {
+            "file": sys.stdout,
+            "dynamic_ncols": True,
+            "leave": False,
+            "mininterval": 0.5,
+        }
+
     def _init_client(self, endpoint: str, api_key: str, name: str) -> Client:
         """初始化Weaviate客户端 (weaviate-client 3.24版本)"""
         auth_config = AuthApiKey(api_key=api_key)
@@ -347,6 +357,57 @@ class WeaviateMigrator:
             logger.error(f"获取schema失败: {e}")
             raise
 
+    def get_class_count_info(self, class_name: str, client_type: str = "source") -> Dict[str, Any]:
+        """
+        获取 class 数量信息，并区分 class 不存在 与 查询异常
+        """
+        client = self.source_client if client_type == "source" else self.target_client
+        schema = client.schema.get()
+        class_exists = any(cls.get('class') == class_name for cls in schema.get('classes', []))
+
+        if not class_exists:
+            return {
+                "exists": False,
+                "count": 0,
+                "error": None
+            }
+
+        try:
+            result = (
+                client.query
+                .aggregate(class_name)
+                .with_meta_count()
+                .do()
+            )
+
+            if "errors" in result:
+                return {
+                    "exists": True,
+                    "count": None,
+                    "error": result["errors"]
+                }
+
+            aggregate_data = result.get('data', {}).get('Aggregate', {}).get(class_name, [])
+            if not aggregate_data:
+                return {
+                    "exists": True,
+                    "count": None,
+                    "error": f"聚合结果缺失: {result}"
+                }
+
+            count = aggregate_data[0]['meta']['count']
+            return {
+                "exists": True,
+                "count": count,
+                "error": None
+            }
+        except Exception as e:
+            return {
+                "exists": True,
+                "count": None,
+                "error": str(e)
+            }
+
     def get_class_object_count(self, class_name: str, client_type: str = "source") -> int:
         """
         获取class中的对象总数
@@ -359,17 +420,15 @@ class WeaviateMigrator:
             对象数量
         """
         try:
-            client = self.source_client if client_type == "source" else self.target_client
+            count_info = self.get_class_count_info(class_name, client_type)
+            if not count_info["exists"]:
+                logger.info(f"Class '{class_name}' ({client_type}) 不存在，计数视为 0")
+                return 0
 
-            # 使用聚合查询获取总数
-            result = (
-                client.query
-                .aggregate(class_name)
-                .with_meta_count()
-                .do()
-            )
+            if count_info["error"] is not None:
+                raise ValueError(count_info["error"])
 
-            count = result['data']['Aggregate'][class_name][0]['meta']['count']
+            count = count_info["count"]
             logger.info(f"Class '{class_name}' ({client_type}) 总数: {count}")
             return count
         except Exception as e:
@@ -481,7 +540,7 @@ class WeaviateMigrator:
         if include_metadata:
             additional_fields.extend(["creationTimeUnix", "lastUpdateTimeUnix"])
 
-        with tqdm(desc=f"获取 {class_name}", unit="对象") as pbar:
+        with tqdm(desc=f"获取 {class_name}", unit="对象", **self._tqdm_kwargs()) as pbar:
             while True:
                 try:
                     # 构建查询
@@ -813,7 +872,7 @@ class WeaviateMigrator:
             deleted = 0
             errors = []
 
-            for obj_id in tqdm(target_ids, desc=f"清空 {class_name}"):
+            for obj_id in tqdm(target_ids, desc=f"清空 {class_name}", **self._tqdm_kwargs()):
                 try:
                     self.target_client.data_object.delete(
                         uuid=obj_id,
@@ -995,7 +1054,7 @@ class WeaviateMigrator:
             'deleted': 0,
         }
 
-        for obj in tqdm(to_add, desc=f"新增 {class_name}"):
+        for obj in tqdm(to_add, desc=f"新增 {class_name}", **self._tqdm_kwargs()):
             if self.migrate_single_object(class_name, obj, operation="create"):
                 stats['success'] += 1
                 stats['created'] += 1
@@ -1003,7 +1062,7 @@ class WeaviateMigrator:
                 stats['failed'] += 1
                 stats['errors'].append(f"新增失败: {obj.get('_additional', {}).get('id', 'unknown')}")
 
-        for obj in tqdm(to_update, desc=f"更新 {class_name}"):
+        for obj in tqdm(to_update, desc=f"更新 {class_name}", **self._tqdm_kwargs()):
             if self.migrate_single_object(class_name, obj, operation="replace"):
                 stats['success'] += 1
                 stats['updated'] += 1
@@ -1011,7 +1070,7 @@ class WeaviateMigrator:
                 stats['failed'] += 1
                 stats['errors'].append(f"更新失败: {obj.get('_additional', {}).get('id', 'unknown')}")
 
-        for obj_id in tqdm(to_delete, desc=f"删除 {class_name}"):
+        for obj_id in tqdm(to_delete, desc=f"删除 {class_name}", **self._tqdm_kwargs()):
             if self.delete_single_object(class_name, obj_id):
                 stats['success'] += 1
                 stats['deleted'] += 1
@@ -1039,7 +1098,7 @@ class WeaviateMigrator:
             'errors': []
         }
 
-        for obj in tqdm(objects, desc=f"回补同步 {class_name}"):
+        for obj in tqdm(objects, desc=f"回补同步 {class_name}", **self._tqdm_kwargs()):
             if self.migrate_single_object(class_name, obj, operation="upsert"):
                 stats['success'] += 1
             else:
@@ -1086,7 +1145,7 @@ class WeaviateMigrator:
         )
 
         with self.target_client.batch as batch:
-            for obj in tqdm(objects, desc=f"迁移 {class_name}"):
+            for obj in tqdm(objects, desc=f"迁移 {class_name}", **self._tqdm_kwargs()):
                 try:
                     # 提取数据
                     obj_id = obj['_additional']['id']
@@ -1295,7 +1354,7 @@ class WeaviateMigrator:
             source_cursor = None
             target_cursor = None
 
-            with tqdm(desc=f"验证 {class_name}", unit="批") as pbar:
+            with tqdm(desc=f"验证 {class_name}", unit="批", **self._tqdm_kwargs()) as pbar:
                 while True:
                     # 分批获取源端
                     source_result = self._fetch_batch_with_cursor(
@@ -1462,8 +1521,12 @@ class WeaviateMigrator:
                 return result
 
             # 2. 检查目标是否有数据
-            target_has_data = self.target_has_data(class_name)
-            result['target_count'] = self.get_class_object_count(class_name, "target")
+            target_count_info = self.get_class_count_info(class_name, "target")
+            if target_count_info["error"] is not None:
+                raise ValueError(f"目标class计数失败: {target_count_info['error']}")
+
+            result['target_count'] = target_count_info["count"] or 0
+            target_has_data = target_count_info["exists"] and result['target_count'] > 0
 
             # 3. 判断迁移策略
             if is_full_sync:
@@ -1472,7 +1535,10 @@ class WeaviateMigrator:
                 logger.info(f"全量同步模式: 清空目标后全量复制")
             else:
                 # 增量同步
-                if not target_has_data:
+                if not target_count_info["exists"]:
+                    sync_mode = "full"
+                    logger.info(f"目标class不存在,执行全量同步")
+                elif not target_has_data:
                     # 目标没数据 -> 全量同步
                     sync_mode = "full"
                     logger.info(f"目标class为空,执行全量同步")
