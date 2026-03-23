@@ -1,0 +1,1551 @@
+#!/usr/bin/env python3
+"""
+Weaviate 数据迁移脚本
+
+功能:
+1. 从源Weaviate实例迁移所有class数据到目标实例
+2. 支持超过10000条数据的class(使用cursor分页)
+3. 完整迁移metadata和vectors
+4. 数据完整性验证
+5. 增量迁移机制(时间戳优先，Hash备选)
+6. 定时任务支持
+7. 企业微信通知(可配置)
+"""
+
+import weaviate
+from weaviate import Client, AuthApiKey
+from typing import Any, Dict, List, Optional
+import logging
+from tqdm import tqdm
+import time
+import json
+import os
+import hashlib
+import requests
+from datetime import datetime
+import schedule
+
+# ================================
+# 配置区域 - 在这里修改配置
+# ================================
+
+# 源Weaviate配置 -测试
+SOURCE_CONFIG = {
+    "endpoint": "http://weaviate-db.paas.paas.test",
+    "api_key": "WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih"
+}
+
+# 目标Weaviate配置 - 测试
+TARGET_CONFIG = {
+    "endpoint": "http://weaviate-db-pre.aigc.paas.test",  # 修改为目标地址
+    "api_key": "WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih"  # 修改为目标API Key
+}
+
+# # 源Weaviate配置 -生产
+# SOURCE_CONFIG = {
+#     "endpoint": "http://weaviate2201.8080-wm.db.idc:8080",
+#     "api_key": "sdhznq4wyyRqlQg9evy]"
+# }
+#
+# # 目标Weaviate配置 - 生产
+# TARGET_CONFIG = {
+#     "endpoint": "http://weaviate2202.8081-wm.db.idc:8081",  # 修改为目标地址
+#     "api_key": "mkjkGiy9yaiT"  # 修改为目标API Key
+# }
+
+# 迁移配置
+MIGRATION_CONFIG = {
+    "batch_size": 100,  # 批量处理大小
+    "state_file": "weaviate_migration_state.json",  # 状态文件路径
+    "log_file": "weaviate_migration.log",  # 日志文件路径
+    "schedule_interval": 1,  # 定时任务间隔(小时)
+}
+
+# 企业微信通知配置(可选，不配置则不发送通知)
+WECOM_CONFIG = {
+    "webhook_url": "",  # 企业微信机器人webhook地址，例如: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxx"
+}
+
+# ================================
+# 配置日志
+# ================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(MIGRATION_CONFIG['log_file']),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# ================================
+# 企业微信通知器
+# ================================
+
+class WeComNotifier:
+    """企业微信通知器"""
+
+    def __init__(self, webhook_url: str = ""):
+        self.webhook_url = webhook_url
+
+    def is_configured(self) -> bool:
+        """检查是否配置了企业微信"""
+        return bool(self.webhook_url and len(self.webhook_url) > 0)
+
+    def send(self, message: str, msg_type: str = "text") -> bool:
+        """发送企业微信消息"""
+        if not self.is_configured():
+            # 无配置时只记录日志
+            logger.info(f"[通知未配置] {message}")
+            return False
+
+        data = {
+            "msgtype": msg_type,
+            msg_type: {"content": message}
+        }
+        try:
+            resp = requests.post(self.webhook_url, json=data, timeout=10)
+            result = resp.json()
+            if result.get('errcode') == 0:
+                logger.info(f"通知发送成功: {message[:50]}...")
+                return True
+            else:
+                logger.error(f"通知发送失败: {result}")
+                return False
+        except Exception as e:
+            logger.error(f"发送告警失败: {e}")
+            return False
+
+    def notify_migration_start(self, class_name: str, mode: str):
+        """通知迁移开始"""
+        mode_desc = "全量" if mode == "full" else "增量"
+        self.send(f"🚀 Weaviate迁移开始\nClass: {class_name}\n模式: {mode_desc}")
+
+    def notify_migration_success(self, class_name: str, mode: str, count: int, details: str = ""):
+        """通知迁移成功"""
+        mode_desc = "全量" if mode == "full" else "增量"
+        msg = f"✅ Weaviate迁移成功\nClass: {class_name}\n模式: {mode_desc}\n数量: {count}"
+        if details:
+            msg += f"\n{details}"
+        self.send(msg)
+
+    def notify_migration_failed(self, class_name: str, mode: str, error: str):
+        """通知迁移失败"""
+        mode_desc = "全量" if mode == "full" else "增量"
+        self.send(f"❌ Weaviate迁移失败\nClass: {class_name}\n模式: {mode_desc}\n错误: {error}")
+
+    def notify_incremental_details(self, class_name: str, added: int, updated: int, unchanged: int):
+        """通知增量同步详情"""
+        self.send(
+            f"🔄 增量同步详情\n"
+            f"Class: {class_name}\n"
+            f"新增: {added}\n"
+            f"更新: {updated}\n"
+            f"未变化: {unchanged}"
+        )
+
+
+# ================================
+# 迁移状态管理
+# ================================
+
+class MigrationState:
+    """迁移状态管理器"""
+
+    def __init__(self, state_file: str):
+        self.state_file = state_file
+        self.state = self._load_state()
+
+    def _load_state(self) -> Dict[str, Any]:
+        """加载状态文件"""
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"加载状态文件失败: {e}, 创建新状态")
+                return {}
+        return {}
+
+    def _save_state(self):
+        """保存状态文件"""
+        try:
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"保存状态文件失败: {e}")
+
+    def get_class_state(self, class_name: str) -> Optional[Dict[str, Any]]:
+        """获取class的迁移状态"""
+        return self.state.get('classes', {}).get(class_name)
+
+    def update_class_state(
+        self,
+        class_name: str,
+        count: int,
+        status: str,
+        timestamp: Optional[str] = None,
+        last_update_time: Optional[int] = None
+    ):
+        """更新class的迁移状态"""
+        if 'classes' not in self.state:
+            self.state['classes'] = {}
+
+        self.state['classes'][class_name] = {
+            'count': count,
+            'status': status,  # 'completed', 'partial', 'failed'
+            'last_migration': timestamp or datetime.now().isoformat(),
+            'last_update_time': last_update_time,  # 记录源数据的最大更新时间
+            'migrations': self.state['classes'].get(class_name, {}).get('migrations', 0) + 1
+        }
+
+        self._save_state()
+
+    def needs_incremental_migration(self, class_name: str, current_count: int) -> bool:
+        """
+        判断是否需要增量迁移
+
+        Args:
+            class_name: class名称
+            current_count: 当前源数据数量
+
+        Returns:
+            是否需要增量迁移
+        """
+        class_state = self.get_class_state(class_name)
+
+        if not class_state:
+            # 从未迁移过,需要全量迁移
+            return True
+
+        if class_state['status'] != 'completed':
+            # 上次迁移未完成,需要重新迁移
+            return True
+
+        if class_state['count'] != current_count:
+            # 数据量有变化,需要增量迁移
+            logger.info(
+                f"Class '{class_name}' 数据量变化: "
+                f"{class_state['count']} -> {current_count}"
+            )
+            return True
+
+        # 数据量相同,检查是否有数据更新(通过时间戳)
+        # 如果有 last_update_time 且当前有更大的时间戳，则需要同步
+        if class_state.get('last_update_time'):
+            # 这里先返回True，让增量同步时做更精确的判断
+            return True
+
+        # 数据量相同,无需迁移
+        return False
+
+    def get_migration_summary(self) -> str:
+        """获取迁移历史摘要"""
+        if not self.state.get('classes'):
+            return "暂无迁移历史"
+
+        summary = ["\n迁移历史摘要:"]
+        summary.append("-" * 60)
+
+        for class_name, info in self.state['classes'].items():
+            summary.append(
+                f"{class_name}:\n"
+                f"  - 数据量: {info['count']}\n"
+                f"  - 状态: {info['status']}\n"
+                f"  - 最后迁移: {info['last_migration']}\n"
+                f"  - 迁移次数: {info['migrations']}"
+            )
+
+        return "\n".join(summary)
+
+
+# ================================
+# Weaviate 迁移器
+# ================================
+
+class WeaviateMigrator:
+    """Weaviate数据迁移工具"""
+
+    def __init__(
+        self,
+        source_endpoint: str,
+        source_api_key: str,
+        target_endpoint: str,
+        target_api_key: str,
+        batch_size: int = 100,
+        state_file: str = "weaviate_migration_state.json",
+        wecom_webhook: str = ""
+    ):
+        """
+        初始化迁移器
+
+        Args:
+            source_endpoint: 源Weaviate端点
+            source_api_key: 源API密钥
+            target_endpoint: 目标Weaviate端点
+            target_api_key: 目标API密钥
+            batch_size: 批量处理大小
+            state_file: 状态文件路径
+            wecom_webhook: 企业微信webhook地址
+        """
+        self.source_client = self._init_client(source_endpoint, source_api_key, "源")
+        self.target_client = self._init_client(target_endpoint, target_api_key, "目标")
+        self.batch_size = batch_size
+        self.state_manager = MigrationState(state_file)
+        self.notifier = WeComNotifier(wecom_webhook)
+
+    def _init_client(self, endpoint: str, api_key: str, name: str) -> Client:
+        """初始化Weaviate客户端 (weaviate-client 3.24版本)"""
+        auth_config = AuthApiKey(api_key=api_key)
+
+        try:
+            client = weaviate.Client(
+                url=endpoint,
+                auth_client_secret=auth_config,
+                timeout_config=(5, 60),
+                startup_period=None
+            )
+            logger.info(f"成功连接到{name}Weaviate: {endpoint}")
+            return client
+        except Exception as e:
+            logger.error(f"连接{name}Weaviate失败 {endpoint}: {e}")
+            raise
+
+    def get_all_classes(self) -> List[str]:
+        """获取所有class名称"""
+        try:
+            schema = self.source_client.schema.get()
+            classes = [cls['class'] for cls in schema.get('classes', [])]
+            logger.info(f"找到 {len(classes)} 个class: {classes}")
+            return classes
+        except Exception as e:
+            logger.error(f"获取schema失败: {e}")
+            raise
+
+    def get_class_object_count(self, class_name: str, client_type: str = "source") -> int:
+        """
+        获取class中的对象总数
+
+        Args:
+            class_name: class名称
+            client_type: 客户端类型 ('source' 或 'target')
+
+        Returns:
+            对象数量
+        """
+        try:
+            client = self.source_client if client_type == "source" else self.target_client
+
+            # 使用聚合查询获取总数
+            result = (
+                client.query
+                .aggregate(class_name)
+                .with_meta_count()
+                .do()
+            )
+
+            count = result['data']['Aggregate'][class_name][0]['meta']['count']
+            logger.info(f"Class '{class_name}' ({client_type}) 总数: {count}")
+            return count
+        except Exception as e:
+            logger.warning(f"无法获取class '{class_name}' ({client_type}) 的计数: {e}")
+            return 0
+
+    def get_class_replication_factor(self, class_name: str, client_type: str = "target") -> int:
+        """
+        获取class的复制因子
+
+        Args:
+            class_name: class名称
+            client_type: 客户端类型 ('source' 或 'target')
+
+        Returns:
+            复制因子数量
+        """
+        try:
+            client = self.source_client if client_type == "source" else self.target_client
+            schema = client.schema.get()
+
+            for cls in schema.get('classes', []):
+                if cls['class'] == class_name:
+                    replication_factor = cls.get('replicationConfig', {}).get('factor', 1)
+                    logger.debug(f"Class '{class_name}' ({client_type}) 复制因子: {replication_factor}")
+                    return replication_factor
+            return 1
+        except Exception as e:
+            logger.warning(f"无法获取class '{class_name}' ({client_type}) 的复制因子: {e}")
+            return 1
+
+    def get_max_update_time(self, class_name: str, client_type: str = "source") -> Optional[int]:
+        """
+        获取class中最大的更新时间戳(毫秒)
+
+        Args:
+            class_name: class名称
+            client_type: 客户端类型
+
+        Returns:
+            最大更新时间戳,失败返回None
+        """
+        try:
+            client = self.source_client if client_type == "source" else self.target_client
+
+            result = (
+                client.query
+                .aggregate(class_name)
+                .with_meta_count()
+                .with_aggregates([
+                    {"path": ["id"], "aggregates": [{"name": "max_time", "property": "*", "filters": {"operator": "Equal", "valueText": "x"}}]}
+                ])
+                .do()
+            )
+            # 注意: Weaviate 3.x 不支持直接获取 max UpdateTime，需要用其他方式
+            # 这里简化处理，返回 None 表示不支持时间过滤
+            return None
+        except Exception as e:
+            logger.warning(f"获取最大更新时间失败: {e}")
+            return None
+
+    def fetch_all_objects_with_cursor(
+        self,
+        class_name: str,
+        client=None,
+        include_vector: bool = True,
+        include_metadata: bool = True,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        使用cursor分页获取class的所有对象
+
+        这个方法可以处理超过10000条数据的class
+
+        Args:
+            class_name: class名称
+            client: 使用的客户端，默认源客户端
+            include_vector: 是否包含向量
+            include_metadata: 是否包含系统metadata
+            limit: 每页数量
+
+        Returns:
+            所有对象的列表
+        """
+        if client is None:
+            client = self.source_client
+
+        all_objects = []
+        cursor = None
+
+        logger.info(f"开始获取class '{class_name}' 的所有对象...")
+
+        # 构建 additional 字段列表
+        additional_fields = ["id"]
+        if include_vector:
+            additional_fields.append("vector")
+        if include_metadata:
+            additional_fields.extend(["creationTimeUnix", "lastUpdateTimeUnix"])
+
+        with tqdm(desc=f"获取 {class_name}", unit="对象") as pbar:
+            while True:
+                try:
+                    # 构建查询
+                    query = (
+                        client.query
+                        .get(class_name)
+                        .with_additional(additional_fields)
+                        .with_limit(limit)
+                    )
+
+                    # 如果有cursor,添加到查询
+                    if cursor:
+                        query = query.with_after(cursor)
+
+                    # 执行查询
+                    result = query.do()
+
+                    # 检查错误
+                    if "errors" in result:
+                        logger.error(f"查询错误: {result['errors']}")
+                        break
+
+                    # 获取数据
+                    data = result.get('data', {}).get('Get', {}).get(class_name, [])
+
+                    if not data:
+                        logger.info("没有更多数据")
+                        break
+
+                    # 添加到结果列表
+                    all_objects.extend(data)
+                    pbar.update(len(data))
+
+                    # 获取下一个cursor(最后一个对象的id)
+                    cursor = data[-1]['_additional']['id']
+
+                    # 如果返回的数据少于limit,说明已经到最后了
+                    if len(data) < limit:
+                        logger.info("已到达最后一页")
+                        break
+
+                except Exception as e:
+                    logger.error(f"获取数据时出错: {e}")
+                    break
+
+        logger.info(f"总共获取了 {len(all_objects)} 个对象")
+        return all_objects
+
+    def compute_object_hash(self, obj: Dict[str, Any]) -> str:
+        """
+        计算对象的Hash值
+
+        Args:
+            obj: 对象数据
+
+        Returns:
+            Hash字符串
+        """
+        # 提取properties和vector用于计算hash
+        properties = {k: v for k, v in obj.items() if k != '_additional'}
+        vector = obj.get('_additional', {}).get('vector')
+
+        data = {
+            "properties": properties,
+            "vector": vector
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+
+    def get_objects_with_hash(
+        self,
+        class_name: str,
+        client=None,
+        include_vector: bool = True
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        获取所有对象及其Hash值
+
+        Args:
+            class_name: class名称
+            client: 使用的客户端
+            include_vector: 是否包含向量
+
+        Returns:
+            {object_id: {hash, data}}
+        """
+        if client is None:
+            client = self.source_client
+
+        objects = self.fetch_all_objects_with_cursor(
+            class_name,
+            client=client,
+            include_vector=include_vector,
+            include_metadata=True,
+            limit=100
+        )
+
+        result = {}
+        for obj in objects:
+            obj_id = obj['_additional']['id']
+            obj_hash = self.compute_object_hash(obj)
+            result[obj_id] = {
+                "hash": obj_hash,
+                "data": obj
+            }
+
+        return result
+
+    def time_based_incremental(
+        self,
+        class_name: str,
+        last_update_time: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        基于时间戳的增量获取
+
+        注意: Weaviate 3.x 原生不支持按 UpdateTime 过滤
+        这个方法作为备选，实际使用时会尝试时间过滤，失败则返回空列表
+
+        Args:
+            class_name: class名称
+            last_update_time: 上次同步的最大更新时间(毫秒)
+
+        Returns:
+            需要同步的对象列表
+        """
+        try:
+            # Weaviate 3.x 使用 Filter 需要额外导入
+            # 这里尝试使用 lastUpdateTimeUnix 过滤
+            from weaviate.filters import Filter
+
+            if last_update_time:
+                # 尝试时间过滤
+                result = (
+                    self.source_client.query
+                    .get(class_name)
+                    .with_additional(["id", "vector", "creationTimeUnix", "lastUpdateTimeUnix"])
+                    .with_where({
+                        "path": ["_lastUpdateTimeUnix"],
+                        "operator": "GreaterThan",
+                        "valueInt": last_update_time
+                    })
+                    .with_limit(10000)
+                    .do()
+                )
+
+                data = result.get('data', {}).get('Get', {}).get(class_name, [])
+                logger.info(f"时间戳增量获取: {len(data)} 个对象")
+                return data
+
+        except Exception as e:
+            logger.warning(f"时间戳增量获取失败: {e}, 将使用Hash差异同步")
+
+        # 返回空列表表示需要使用Hash方式
+        return []
+
+    def hash_based_incremental(
+        self,
+        class_name: str
+    ) -> Dict[str, Any]:
+        """
+        基于Hash的差异同步
+
+        Args:
+            class_name: class名称
+
+        Returns:
+            同步结果: {to_add, to_update, unchanged}
+        """
+        logger.info(f"开始Hash差异对比: {class_name}")
+
+        # 获取源端所有对象
+        logger.info(f"获取源端 {class_name} 对象...")
+        source_objects = self.get_objects_with_hash(class_name, self.source_client)
+        logger.info(f"源端对象数: {len(source_objects)}")
+
+        # 获取目标端所有对象
+        logger.info(f"获取目标端 {class_name} 对象...")
+        try:
+            target_objects = self.get_objects_with_hash(class_name, self.target_client)
+            logger.info(f"目标端对象数: {len(target_objects)}")
+        except Exception as e:
+            logger.warning(f"获取目标端对象失败: {e}, 将执行全量同步")
+            return {
+                "to_add": list(source_objects.values()),
+                "to_update": [],
+                "unchanged": 0,
+                "full_sync": True
+            }
+
+        # 计算差异
+        to_add = []      # 源有，目标没有
+        to_update = []   # 源和目标都有但Hash不同
+        unchanged = 0    # 未变化的数量
+
+        source_ids = set(source_objects.keys())
+        target_ids = set(target_objects.keys())
+
+        # 新增的对象
+        for obj_id in source_ids - target_ids:
+            to_add.append(source_objects[obj_id]["data"])
+
+        # 需要更新的对象
+        for obj_id in source_ids & target_ids:
+            if source_objects[obj_id]["hash"] != target_objects[obj_id]["hash"]:
+                to_update.append(source_objects[obj_id]["data"])
+            else:
+                unchanged += 1
+
+        logger.info(f"Hash差异分析结果:")
+        logger.info(f"  - 需要新增: {len(to_add)}")
+        logger.info(f"  - 需要更新: {len(to_update)}")
+        logger.info(f"  - 未变化: {unchanged}")
+
+        return {
+            "to_add": to_add,
+            "to_update": to_update,
+            "unchanged": unchanged,
+            "full_sync": False
+        }
+
+    def target_has_data(self, class_name: str) -> bool:
+        """检查目标class是否有数据"""
+        count = self.get_class_object_count(class_name, "target")
+        return count > 0
+
+    def clear_target_class(self, class_name: str) -> bool:
+        """
+        清空目标class的所有数据
+
+        Args:
+            class_name: class名称
+
+        Returns:
+            是否成功
+        """
+        try:
+            logger.info(f"开始清空目标class '{class_name}' 的数据...")
+
+            # 批量删除所有对象
+            where_filter = {
+                "operator": "And",
+                "operands": []
+            }
+
+            result = self.target_client.batch.delete_objects(
+                class_name=class_name,
+                where=where_filter,
+                output="minimal"
+            )
+
+            logger.info(f"清空完成: {result}")
+            return True
+
+        except Exception as e:
+            logger.error(f"清空目标class失败: {e}")
+            return False
+
+    def migrate_class_schema(self, class_name: str) -> tuple:
+        """
+        迁移class的schema到目标实例
+
+        复制因子完全按目标数据库配置：
+        - 如果目标端class已存在 → 保留原配置
+        - 如果目标端class不存在 → 从目标数据库读取复制因子创建
+
+        Args:
+            class_name: class名称
+
+        Returns:
+            (是否成功, 复制因子)
+        """
+        try:
+            # 获取源schema
+            schema = self.source_client.schema.get()
+            class_schema = None
+
+            for cls in schema.get('classes', []):
+                if cls['class'] == class_name:
+                    class_schema = cls
+                    break
+
+            if not class_schema:
+                logger.error(f"找不到class '{class_name}' 的schema")
+                return (False, 0)
+
+            # 检查目标是否已存在
+            target_schema = self.target_client.schema.get()
+            for cls in target_schema.get('classes', []):
+                if cls['class'] == class_name:
+                    logger.info(f"Class '{class_name}' 已存在于目标实例，保留原配置")
+                    # 记录目标端的复制因子
+                    replication_factor = cls.get('replicationConfig', {}).get('factor', 1)
+                    logger.info(f"目标端 class '{class_name}' 复制因子: {replication_factor}")
+                    return (True, replication_factor)
+
+            # 目标端class不存在，从目标数据库读取复制因子
+            # 获取目标端的默认复制因子配置
+            target_replication_factor = 1  # 默认值
+            try:
+                # 尝试通过获取目标端其他class的配置来推断默认复制因子
+                if target_schema.get('classes'):
+                    # 使用目标端第一个class的复制因子作为参考
+                    first_class = target_schema['classes'][0]
+                    target_replication_factor = first_class.get('replicationConfig', {}).get('factor', 1)
+                    logger.info(f"从目标端获取默认复制因子: {target_replication_factor}")
+            except Exception as e:
+                logger.warning(f"无法获取目标端默认复制因子，使用默认值1: {e}")
+
+            # 移除源端的复制因子配置，使用目标端的配置
+            if 'replicationConfig' in class_schema:
+                class_schema['replicationConfig']['factor'] = target_replication_factor
+            else:
+                class_schema['replicationConfig'] = {'factor': target_replication_factor}
+
+            # 创建class
+            self.target_client.schema.create_class(class_schema)
+            logger.info(f"成功创建class '{class_name}'，复制因子: {target_replication_factor}")
+            return (True, target_replication_factor)
+
+        except Exception as e:
+            logger.error(f"迁移schema失败: {e}")
+            return (False, 0)
+
+    def migrate_single_object(
+        self,
+        class_name: str,
+        obj: Dict[str, Any]
+    ) -> bool:
+        """
+        迁移单个对象
+
+        Args:
+            class_name: class名称
+            obj: 对象数据
+
+        Returns:
+            是否成功
+        """
+        try:
+            obj_id = obj['_additional']['id']
+            vector = obj['_additional'].get('vector')
+            properties = {k: v for k, v in obj.items() if k != '_additional'}
+
+            # 尝试更新，如果不存在则创建
+            self.target_client.data_object.update(
+                data_object=properties,
+                class_name=class_name,
+                uuid=obj_id
+            )
+            return True
+        except Exception as e:
+            # 如果更新失败，尝试创建
+            try:
+                obj_id = obj['_additional']['id']
+                vector = obj['_additional'].get('vector')
+                properties = {k: v for k, v in obj.items() if k != '_additional'}
+
+                self.target_client.data_object.create(
+                    data_object=properties,
+                    class_name=class_name,
+                    uuid=obj_id,
+                    vector=vector
+                )
+                return True
+            except Exception as e2:
+                logger.error(f"迁移对象失败: {e2}")
+                return False
+
+    def migrate_objects(
+        self,
+        class_name: str,
+        objects: List[Dict[str, Any]],
+        mode: str = "full"
+    ) -> Dict[str, Any]:
+        """
+        批量迁移对象到目标实例
+
+        Args:
+            class_name: class名称
+            objects: 对象列表
+            mode: 迁移模式 'full' 或 'incremental'
+
+        Returns:
+            迁移统计信息
+        """
+        stats = {
+            'total': len(objects),
+            'success': 0,
+            'failed': 0,
+            'errors': []
+        }
+
+        logger.info(f"开始迁移 {len(objects)} 个对象到class '{class_name}' (模式: {mode})...")
+
+        if not objects:
+            return stats
+
+        # 配置批量处理
+        self.target_client.batch.configure(
+            batch_size=self.batch_size,
+            dynamic=True,
+            timeout_retries=3,
+        )
+
+        with self.target_client.batch as batch:
+            for obj in tqdm(objects, desc=f"迁移 {class_name}"):
+                try:
+                    # 提取数据
+                    obj_id = obj['_additional']['id']
+                    vector = obj['_additional'].get('vector')
+                    properties = {k: v for k, v in obj.items() if k != '_additional'}
+
+                    # 添加到批量处理
+                    batch.add_data_object(
+                        data_object=properties,
+                        class_name=class_name,
+                        uuid=obj_id,
+                        vector=vector,
+                    )
+
+                    stats['success'] += 1
+
+                except Exception as e:
+                    stats['failed'] += 1
+                    error_msg = f"对象 {obj.get('_additional', {}).get('id', 'unknown')}: {str(e)}"
+                    stats['errors'].append(error_msg)
+                    logger.error(error_msg)
+
+        logger.info(f"迁移完成: 成功 {stats['success']}, 失败 {stats['failed']}")
+        return stats
+
+    def verify_migration(
+        self,
+        class_name: str,
+        expected_count: int
+    ) -> Dict[str, Any]:
+        """
+        验证迁移的数据完整性
+
+        Args:
+            class_name: class名称
+            expected_count: 预期的对象数量
+
+        Returns:
+            验证结果
+        """
+        logger.info(f"开始验证class '{class_name}' 的数据完整性...")
+
+        verification = {
+            'class_name': class_name,
+            'expected_count': expected_count,
+            'actual_count': 0,
+            'match': False,
+            'sample_check': False,
+            'errors': []
+        }
+
+        try:
+            # 1. 检查总数
+            actual_count = self.get_class_object_count(class_name, "target")
+            verification['actual_count'] = actual_count
+            verification['match'] = (actual_count == expected_count)
+
+            if not verification['match']:
+                verification['errors'].append(
+                    f"数量不匹配: 预期 {expected_count}, 实际 {actual_count}"
+                )
+
+            # 2. 抽样检查metadata完整性
+            sample_objects_source = self.fetch_all_objects_with_cursor(
+                class_name,
+                client=self.source_client,
+                limit=10
+            )
+
+            if sample_objects_source:
+                # 检查这些对象在目标中是否存在且metadata一致
+                for src_obj in sample_objects_source[:5]:  # 只检查前5个
+                    obj_id = src_obj['_additional']['id']
+
+                    # 在目标中查询
+                    result = (
+                        self.target_client.query
+                        .get(class_name)
+                        .with_additional(["id", "vector"])
+                        .with_where({
+                            "path": ["id"],
+                            "operator": "Equal",
+                            "valueText": obj_id
+                        })
+                        .with_limit(1)
+                        .do()
+                    )
+
+                    target_objs = result.get('data', {}).get('Get', {}).get(class_name, [])
+
+                    if not target_objs:
+                        verification['errors'].append(f"对象 {obj_id} 在目标中不存在")
+                        continue
+
+                    tgt_obj = target_objs[0]
+
+                    # 比较properties
+                    src_props = {k: v for k, v in src_obj.items() if k != '_additional'}
+                    tgt_props = {k: v for k, v in tgt_obj.items() if k != '_additional'}
+
+                    if src_props != tgt_props:
+                        verification['errors'].append(
+                            f"对象 {obj_id} 的metadata不匹配"
+                        )
+                        continue
+
+                verification['sample_check'] = len(verification['errors']) == 0
+
+        except Exception as e:
+            verification['errors'].append(f"验证过程出错: {str(e)}")
+
+        # 输出验证结果
+        if verification['match'] and verification['sample_check']:
+            logger.info(f"✓ 验证通过: class '{class_name}' 数据完整")
+        else:
+            logger.warning(f"✗ 验证失败: {verification['errors']}")
+
+        return verification
+
+    def migrate_class(
+        self,
+        class_name: str,
+        force: bool = False,
+        mode: str = "auto"
+    ) -> Dict[str, Any]:
+        """
+        迁移单个class的所有数据
+
+        Args:
+            class_name: class名称
+            force: 是否强制迁移(忽略增量检查)
+            mode: 迁移模式 'full'(全量), 'incremental'(增量), 'auto'(自动)
+
+        Returns:
+            迁移结果
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info(f"开始迁移class: {class_name}, 模式: {mode}")
+        logger.info(f"{'='*60}")
+
+        result = {
+            'class_name': class_name,
+            'mode': mode,
+            'success': False,
+            'source_count': 0,
+            'target_count': 0,
+            'migrated_count': 0,
+            'replication_factor': 0,
+            'skipped': False,
+            'incremental_details': {},
+            'errors': []
+        }
+
+        # 确定迁移模式
+        is_full_sync = force or mode == "full"
+
+        try:
+            # 1. 获取源数据总数
+            source_count = self.get_class_object_count(class_name, "source")
+            result['source_count'] = source_count
+
+            if source_count == 0:
+                logger.warning(f"Class '{class_name}' 没有数据,跳过")
+                result['success'] = True
+                result['skipped'] = True
+                self.state_manager.update_class_state(class_name, 0, 'completed')
+                return result
+
+            # 2. 检查目标是否有数据
+            target_has_data = self.target_has_data(class_name)
+            result['target_count'] = self.get_class_object_count(class_name, "target")
+
+            # 3. 判断迁移策略
+            if is_full_sync:
+                # 全量同步: 清空目标 -> 全量复制
+                sync_mode = "full"
+                logger.info(f"全量同步模式: 清空目标后全量复制")
+            else:
+                # 增量同步
+                if not target_has_data:
+                    # 目标没数据 -> 全量同步
+                    sync_mode = "full"
+                    logger.info(f"目标class为空,执行全量同步")
+                else:
+                    # 目标有数据 -> 增量同步
+                    sync_mode = "incremental"
+                    logger.info(f"目标class已有数据,执行增量同步")
+
+            # 发送开始通知
+            if not force:  # force 模式下不发送通知
+                self.notifier.notify_migration_start(class_name, sync_mode)
+
+            # 4. 迁移schema
+            schema_success, replication_factor = self.migrate_class_schema(class_name)
+            result['replication_factor'] = replication_factor
+            if not schema_success:
+                result['errors'].append("Schema迁移失败")
+                self.state_manager.update_class_state(class_name, source_count, 'failed')
+                if not force:
+                    self.notifier.notify_migration_failed(class_name, sync_mode, "Schema迁移失败")
+                return result
+
+            # 5. 根据模式执行迁移
+            if sync_mode == "full":
+                # 全量同步: 先清空目标
+                if target_has_data:
+                    logger.info("清空目标数据...")
+                    if not self.clear_target_class(class_name):
+                        result['errors'].append("清空目标数据失败")
+                        self.state_manager.update_class_state(class_name, source_count, 'failed')
+                        if not force:
+                            self.notifier.notify_migration_failed(class_name, sync_mode, "清空目标数据失败")
+                        return result
+
+                # 获取所有对象
+                objects = self.fetch_all_objects_with_cursor(class_name)
+
+                # 迁移对象
+                migration_stats = self.migrate_objects(class_name, objects, mode="full")
+                result['migrated_count'] = migration_stats['success']
+
+                if migration_stats['failed'] > 0:
+                    result['errors'].extend(migration_stats['errors'][:10])  # 限制错误数量
+
+                # 验证
+                verification = self.verify_migration(class_name, source_count)
+
+                result['success'] = (
+                    migration_stats['failed'] == 0 and
+                    verification['match'] and
+                    verification['sample_check']
+                )
+
+                # 记录状态
+                self.state_manager.update_class_state(
+                    class_name, source_count,
+                    'completed' if result['success'] else 'failed'
+                )
+
+                # 通知结果
+                if not force:
+                    if result['success']:
+                        details = f"成功: {result['migrated_count']}, 失败: {migration_stats['failed']}"
+                        self.notifier.notify_migration_success(class_name, sync_mode, result['migrated_count'], details)
+                    else:
+                        error_msg = result['errors'][0] if result['errors'] else "未知错误"
+                        self.notifier.notify_migration_failed(class_name, sync_mode, error_msg)
+
+            else:
+                # 增量同步: 优先时间戳，失败则Hash差异
+                logger.info(f"执行增量同步: {class_name}")
+
+                # 优先尝试时间戳增量
+                class_state = self.state_manager.get_class_state(class_name)
+                last_update_time = class_state.get('last_update_time') if class_state else None
+
+                incremental_objects = self.time_based_incremental(class_name, last_update_time)
+
+                if not incremental_objects:
+                    # 时间戳不支持，使用Hash差异
+                    logger.info("时间戳过滤不支持，使用Hash差异同步")
+                    hash_result = self.hash_based_incremental(class_name)
+
+                    if hash_result.get("full_sync"):
+                        # 目标获取失败，执行全量
+                        logger.info("目标获取失败，执行全量同步")
+                        objects = self.fetch_all_objects_with_cursor(class_name)
+                        migration_stats = self.migrate_objects(class_name, objects, mode="incremental")
+                    else:
+                        # 增量同步
+                        to_migrate = hash_result["to_add"] + hash_result["to_update"]
+
+                        if to_migrate:
+                            migration_stats = self.migrate_objects(class_name, to_migrate, mode="incremental")
+                        else:
+                            migration_stats = {'total': 0, 'success': 0, 'failed': 0, 'errors': []}
+
+                        # 记录增量详情
+                        result['incremental_details'] = {
+                            "added": len(hash_result["to_add"]),
+                            "updated": len(hash_result["to_update"]),
+                            "unchanged": hash_result["unchanged"]
+                        }
+
+                        # 发送增量详情通知
+                        if not force and (hash_result["to_add"] or hash_result["to_update"]):
+                            self.notifier.notify_incremental_details(
+                                class_name,
+                                len(hash_result["to_add"]),
+                                len(hash_result["to_update"]),
+                                hash_result["unchanged"]
+                            )
+
+                        # 输出增量日志
+                        logger.info(f"增量同步完成:")
+                        logger.info(f"  - 新增: {len(hash_result['to_add'])}")
+                        logger.info(f"  - 更新: {len(hash_result['to_update'])}")
+                        logger.info(f"  - 未变化: {hash_result['unchanged']}")
+
+                        result['migrated_count'] = migration_stats['success']
+                        result['success'] = migration_stats['failed'] == 0
+
+                        # 更新状态
+                        self.state_manager.update_class_state(
+                            class_name, source_count,
+                            'completed' if result['success'] else 'failed'
+                        )
+
+                        if not force:
+                            if result['success']:
+                                self.notifier.notify_migration_success(
+                                    class_name, sync_mode, result['migrated_count'],
+                                    f"新增:{len(hash_result['to_add'])}, 更新:{len(hash_result['to_update'])}, 未变化:{hash_result['unchanged']}"
+                                )
+                            else:
+                                self.notifier.notify_migration_failed(class_name, sync_mode, "部分对象迁移失败")
+                else:
+                    # 时间戳增量成功
+                    migration_stats = self.migrate_objects(class_name, incremental_objects, mode="incremental")
+                    result['migrated_count'] = migration_stats['success']
+                    result['success'] = migration_stats['failed'] == 0
+
+                    result['incremental_details'] = {
+                        "added": len(incremental_objects),
+                        "updated": 0,
+                        "unchanged": source_count - len(incremental_objects)
+                    }
+
+                    # 更新状态
+                    self.state_manager.update_class_state(
+                        class_name, source_count,
+                        'completed' if result['success'] else 'failed'
+                    )
+
+        except Exception as e:
+            result['errors'].append(f"迁移过程出错: {str(e)}")
+            logger.error(f"迁移class '{class_name}' 失败: {e}")
+            self.state_manager.update_class_state(class_name, result['source_count'], 'failed')
+            if not force:
+                self.notifier.notify_migration_failed(class_name, sync_mode if 'sync_mode' in dir() else "unknown", str(e))
+
+        # 获取目标端最终复制因子
+        if result['replication_factor'] == 0:
+            result['replication_factor'] = self.get_class_replication_factor(class_name, "target")
+
+        return result
+
+    def migrate_all(
+        self,
+        class_filter: Optional[List[str]] = None,
+        force: bool = False,
+        mode: str = "auto"
+    ) -> Dict[str, Any]:
+        """
+        迁移所有class
+
+        Args:
+            class_filter: 要迁移的class列表,None表示全部
+            force: 是否强制迁移(忽略增量检查)
+            mode: 迁移模式 'full'(全量), 'incremental'(增量), 'auto'(自动)
+
+        Returns:
+            迁移汇总结果
+        """
+        logger.info("\n" + "="*60)
+        logger.info(f"开始迁移 (模式: {mode}, force: {force})")
+        logger.info("="*60)
+
+        summary = {
+            'total_classes': 0,
+            'successful': 0,
+            'failed': 0,
+            'skipped': 0,
+            'total_objects': 0,
+            'mode': mode,
+            'results': []
+        }
+
+        try:
+            # 获取所有class
+            classes = class_filter if class_filter else self.get_all_classes()
+            summary['total_classes'] = len(classes)
+
+            # 迁移每个class
+            for class_name in classes:
+                result = self.migrate_class(class_name, force=force, mode=mode)
+                summary['results'].append(result)
+
+                if result['skipped']:
+                    summary['skipped'] += 1
+                elif result['success']:
+                    summary['successful'] += 1
+                    summary['total_objects'] += result['migrated_count']
+                else:
+                    summary['failed'] += 1
+
+            # 输出汇总
+            logger.info("\n" + "="*60)
+            logger.info("迁移汇总")
+            logger.info("="*60)
+            logger.info(f"模式: {mode}")
+            logger.info(f"总class数: {summary['total_classes']}")
+            logger.info(f"成功: {summary['successful']}")
+            logger.info(f"失败: {summary['failed']}")
+            logger.info(f"跳过: {summary['skipped']}")
+            logger.info(f"总迁移对象数: {summary['total_objects']}")
+
+            for result in summary['results']:
+                if result['skipped']:
+                    status = "⊘"
+                    msg = "跳过"
+                elif result['success']:
+                    status = "✓"
+                    msg = "成功"
+                else:
+                    status = "✗"
+                    msg = "失败"
+
+                # 输出详细信息
+                if result.get('incremental_details'):
+                    details = result['incremental_details']
+                    detail_str = f" [新增:{details.get('added', 0)}, 更新:{details.get('updated', 0)}, 未变化:{details.get('unchanged', 0)}]"
+                else:
+                    detail_str = ""
+
+                logger.info(
+                    f"{status} {result['class_name']}: {msg} - "
+                    f"{result['migrated_count']}/{result['source_count']} "
+                    f"[副本:{result['replication_factor']}]{detail_str}"
+                )
+                if result['errors']:
+                    for error in result['errors']:
+                        logger.error(f"  - {error}")
+
+        except Exception as e:
+            logger.error(f"迁移失败: {e}")
+            summary['error'] = str(e)
+
+        return summary
+
+
+# ================================
+# 测试和菜单功能
+# ================================
+
+def test_data_integrity(migrator: WeaviateMigrator):
+    """测试数据完整性"""
+    print("\n" + "="*60)
+    print("Weaviate 数据完整性测试")
+    print("="*60)
+
+    try:
+        # 获取所有class
+        classes = migrator.get_all_classes()
+
+        if not classes:
+            print("\n没有找到任何class")
+            return
+
+        print(f"\n找到 {len(classes)} 个class")
+
+        # 测试每个class的数据完整性
+        for class_name in classes:
+            print(f"\n{'='*60}")
+            print(f"测试class: {class_name}")
+            print(f"{'='*60}")
+
+            # 获取总数
+            count = migrator.get_class_object_count(class_name, "source")
+            print(f"对象总数: {count}")
+
+            if count > 0:
+                # 测试cursor分页是否能获取所有数据
+                print("\n测试cursor分页获取所有数据...")
+                objects = migrator.fetch_all_objects_with_cursor(
+                    class_name,
+                    limit=100
+                )
+
+                print(f"实际获取: {len(objects)} 个对象")
+
+                if len(objects) == count:
+                    print("✓ 数据完整性测试通过!")
+                else:
+                    print(f"✗ 数据完整性测试失败!")
+                    print(f"  预期: {count}")
+                    print(f"  实际: {len(objects)}")
+                    print(f"  差异: {count - len(objects)}")
+
+                # 检查metadata完整性
+                print("\n检查metadata完整性...")
+                if objects:
+                    sample = objects[0]
+                    print(f"样本对象ID: {sample['_additional']['id']}")
+                    print(f"包含向量: {'vector' in sample['_additional']}")
+                    print(f"包含创建时间: {'creationTimeUnix' in sample['_additional']}")
+                    print(f"包含更新时间: {'lastUpdateTimeUnix' in sample['_additional']}")
+                    print(f"Properties: {list(sample.keys())}")
+
+                    # 显示所有properties
+                    for key, value in sample.items():
+                        if key != '_additional':
+                            print(f"  - {key}: {type(value).__name__}")
+
+    except Exception as e:
+        print(f"\n测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def show_menu():
+    """显示交互式菜单"""
+    print("\n" + "="*60)
+    print("Weaviate 数据迁移工具")
+    print("="*60)
+    print("\n请选择操作模式:")
+    print("-" * 60)
+    print("1. 测试数据完整性")
+    print("2. 全量迁移(迁移所有class)")
+    print("3. 增量迁移(只迁移有变化的class)")
+    print("4. 指定class迁移")
+    print("5. 定时增量迁移(每小时迁移一个class)")
+    print("6. 查看迁移历史")
+    print("7. 退出")
+    print("-" * 60)
+
+
+def scheduled_migration(migrator: WeaviateMigrator, interval_hours: int = 1):
+    """
+    定时增量迁移
+
+    Args:
+        migrator: 迁移器实例
+        interval_hours: 间隔小时数
+    """
+    print(f"\n启动定时增量迁移,间隔: {interval_hours} 小时")
+    print("按 Ctrl+C 停止定时任务\n")
+
+    classes = migrator.get_all_classes()
+    current_index = 0
+
+    def migrate_next_class():
+        nonlocal current_index
+
+        if current_index >= len(classes):
+            current_index = 0
+            logger.info("\n所有class已迁移完成,重新开始循环")
+
+        class_name = classes[current_index]
+        logger.info(f"\n定时任务: 开始迁移 class '{class_name}'")
+
+        try:
+            result = migrator.migrate_class(class_name, force=False, mode="auto")
+
+            if result['success']:
+                logger.info(f"✓ Class '{class_name}' 迁移成功")
+            else:
+                logger.error(f"✗ Class '{class_name}' 迁移失败")
+
+        except Exception as e:
+            logger.error(f"迁移 class '{class_name}' 时出错: {e}")
+
+        current_index += 1
+
+    # 立即执行第一次
+    migrate_next_class()
+
+    # 设置定时任务
+    schedule.every(interval_hours).hours.do(migrate_next_class)
+
+    # 运行定时任务
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # 每分钟检查一次
+    except KeyboardInterrupt:
+        print("\n\n定时任务已停止")
+
+
+def interactive_mode():
+    """交互式模式"""
+    # 初始化迁移器
+    try:
+        migrator = WeaviateMigrator(
+            source_endpoint=SOURCE_CONFIG['endpoint'],
+            source_api_key=SOURCE_CONFIG['api_key'],
+            target_endpoint=TARGET_CONFIG['endpoint'],
+            target_api_key=TARGET_CONFIG['api_key'],
+            batch_size=MIGRATION_CONFIG['batch_size'],
+            state_file=MIGRATION_CONFIG['state_file'],
+            wecom_webhook=WECOM_CONFIG.get('webhook_url', '')
+        )
+    except Exception as e:
+        print(f"\n初始化迁移器失败: {e}")
+        print("\n请检查配置:")
+        print(f"  源端点: {SOURCE_CONFIG['endpoint']}")
+        print(f"  目标端点: {TARGET_CONFIG['endpoint']}")
+        return
+
+    while True:
+        show_menu()
+
+        try:
+            choice = input("\n请输入选项 (1-7): ").strip()
+
+            if choice == '1':
+                # 测试数据完整性
+                test_data_integrity(migrator)
+
+            elif choice == '2':
+                # 全量迁移
+                confirm = input("\n确认执行全量迁移? (y/n): ").strip().lower()
+                if confirm == 'y':
+                    migrator.migrate_all(force=True, mode="full")
+                else:
+                    print("已取消")
+
+            elif choice == '3':
+                # 增量迁移
+                print("\n开始增量迁移...")
+                migrator.migrate_all(force=False, mode="auto")
+
+            elif choice == '4':
+                # 指定class迁移
+                classes_input = input("\n请输入要迁移的class名称(多个用空格分隔): ").strip()
+                if classes_input:
+                    class_list = classes_input.split()
+                    print(f"\n将迁移以下class: {class_list}")
+                    confirm = input("确认? (y/n): ").strip().lower()
+                    if confirm == 'y':
+                        migrator.migrate_all(class_filter=class_list, force=True, mode="full")
+                    else:
+                        print("已取消")
+                else:
+                    print("未输入class名称")
+
+            elif choice == '5':
+                # 定时增量迁移
+                interval_input = input(f"\n请输入间隔小时数(默认{MIGRATION_CONFIG['schedule_interval']}): ").strip()
+                interval = int(interval_input) if interval_input else MIGRATION_CONFIG['schedule_interval']
+
+                print(f"\n将每 {interval} 小时迁移一个class")
+                confirm = input("确认启动定时任务? (y/n): ").strip().lower()
+
+                if confirm == 'y':
+                    scheduled_migration(migrator, interval)
+                else:
+                    print("已取消")
+
+            elif choice == '6':
+                # 查看迁移历史
+                print(migrator.state_manager.get_migration_summary())
+
+            elif choice == '7':
+                # 退出
+                print("\n再见!")
+                break
+
+            else:
+                print("\n无效选项,请重新选择")
+
+            input("\n按回车键继续...")
+
+        except KeyboardInterrupt:
+            print("\n\n已取消操作")
+            break
+        except Exception as e:
+            print(f"\n操作失败: {e}")
+            import traceback
+            traceback.print_exc()
+            input("\n按回车键继续...")
+
+
+# ================================
+# 主函数
+# ================================
+
+def main():
+    """主函数"""
+    print("\n" + "="*60)
+    print("Weaviate 数据迁移工具")
+    print("="*60)
+    print("\n当前配置:")
+    print(f"  源端点: {SOURCE_CONFIG['endpoint']}")
+    print(f"  目标端点: {TARGET_CONFIG['endpoint']}")
+    print(f"  批量大小: {MIGRATION_CONFIG['batch_size']}")
+    print(f"  状态文件: {MIGRATION_CONFIG['state_file']}")
+    print(f"  企业微信: {'已配置' if WECOM_CONFIG.get('webhook_url') else '未配置'}")
+
+    # 启动交互式模式
+    interactive_mode()
+
+
+if __name__ == '__main__':
+    main()
