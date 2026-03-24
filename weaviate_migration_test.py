@@ -59,7 +59,6 @@ MIGRATION_CONFIG = {
     "batch_size": 100,  # 批量处理大小
     "state_file": "weaviate_migration_state.json",  # 状态文件路径
     "log_file": "weaviate_migration.log",  # 日志文件路径
-    "schedule_interval": 1,  # 定时任务间隔(小时)
     "schedule_timezone": "Asia/Shanghai",  # 定时任务时区
     "schedule_start_hour": 0,  # 每日允许执行开始时间（含）
     "schedule_end_hour": 6,  # 每日允许执行结束时间（不含）
@@ -459,6 +458,46 @@ class WeaviateMigrator:
         except Exception as e:
             logger.warning(f"无法获取class '{class_name}' ({client_type}) 的复制因子: {e}")
             return 1
+
+    def get_target_default_replication_factor(self) -> int:
+        """
+        从目标集群状态获取默认复制因子
+
+        优先取目标集群 READY 节点数；
+        如果拿不到，再回退到目标端已有 class 的复制因子；
+        最后兜底为 1。
+        """
+        try:
+            nodes = self.target_client.cluster.get_nodes_status()
+            ready_nodes = [node for node in nodes if node.get("status") == "READY"]
+            if ready_nodes:
+                replication_factor = len(ready_nodes)
+                logger.info(f"从目标集群 READY 节点数获取默认复制因子: {replication_factor}")
+                return replication_factor
+
+            if nodes:
+                replication_factor = len(nodes)
+                logger.info(f"目标集群无 READY 状态，使用节点总数作为默认复制因子: {replication_factor}")
+                return replication_factor
+        except Exception as e:
+            logger.warning(f"无法从目标集群状态获取复制因子: {e}")
+
+        try:
+            target_schema = self.target_client.schema.get()
+            if target_schema.get('classes'):
+                factors = [
+                    cls.get('replicationConfig', {}).get('factor', 1)
+                    for cls in target_schema.get('classes', [])
+                ]
+                if factors:
+                    replication_factor = max(factors)
+                    logger.info(f"回退使用目标端已有class的最大复制因子: {replication_factor}")
+                    return replication_factor
+        except Exception as e:
+            logger.warning(f"无法从目标schema回退获取复制因子: {e}")
+
+        logger.warning("无法确定目标端默认复制因子，使用默认值 1")
+        return 1
 
     def get_class_property_names(self, class_name: str, client=None) -> List[str]:
         """获取 class 的全部属性名，用于完整查询 properties"""
@@ -937,18 +976,8 @@ class WeaviateMigrator:
                     logger.info(f"目标端 class '{class_name}' 复制因子: {replication_factor}")
                     return (True, replication_factor)
 
-            # 目标端class不存在，从目标数据库读取复制因子
-            # 获取目标端的默认复制因子配置
-            target_replication_factor = 1  # 默认值
-            try:
-                # 尝试通过获取目标端其他class的配置来推断默认复制因子
-                if target_schema.get('classes'):
-                    # 使用目标端第一个class的复制因子作为参考
-                    first_class = target_schema['classes'][0]
-                    target_replication_factor = first_class.get('replicationConfig', {}).get('factor', 1)
-                    logger.info(f"从目标端获取默认复制因子: {target_replication_factor}")
-            except Exception as e:
-                logger.warning(f"无法获取目标端默认复制因子，使用默认值1: {e}")
+            # 目标端class不存在，从目标集群状态获取复制因子
+            target_replication_factor = self.get_target_default_replication_factor()
 
             # 移除源端的复制因子配置，使用目标端的配置
             if 'replicationConfig' in class_schema:
@@ -1888,7 +1917,7 @@ def show_menu():
     print("2. 全量迁移(迁移所有class)")
     print("3. 增量迁移(只迁移有变化的class)")
     print("4. 指定class迁移(自动判断全量/增量)")
-    print("5. 定时增量迁移(北京时间每天0点-6点按小时迁移)")
+    print("5. 定时增量迁移(北京时间每天0点-6点连续执行)")
     print("6. 查看迁移历史")
     print("7. 退出")
     print("-" * 60)
@@ -1906,25 +1935,24 @@ def is_in_schedule_window(now: datetime) -> bool:
     return start_hour <= now.hour < end_hour
 
 
-def scheduled_migration(migrator: WeaviateMigrator, interval_hours: int = 1):
+def scheduled_migration(migrator: WeaviateMigrator):
     """
     定时增量迁移
 
     Args:
         migrator: 迁移器实例
-        interval_hours: 间隔小时数
     """
     timezone_name = MIGRATION_CONFIG["schedule_timezone"]
     start_hour = MIGRATION_CONFIG["schedule_start_hour"]
     end_hour = MIGRATION_CONFIG["schedule_end_hour"]
 
-    print(f"\n启动定时增量迁移,间隔: {interval_hours} 小时")
+    print(f"\n启动定时增量迁移")
     print(f"执行窗口: 每天 {start_hour:02d}:00 - {end_hour:02d}:00 ({timezone_name})")
+    print("窗口内将按 class 顺序连续迁移，跑完一个接着跑下一个")
     print("按 Ctrl+C 停止定时任务\n")
 
     classes = migrator.get_all_classes()
     current_index = 0
-    last_run_slot = None
 
     def migrate_next_class():
         nonlocal current_index
@@ -1952,19 +1980,15 @@ def scheduled_migration(migrator: WeaviateMigrator, interval_hours: int = 1):
     try:
         while True:
             now = get_schedule_now()
-            slot_key = now.strftime("%Y-%m-%d %H")
             in_window = is_in_schedule_window(now)
-            on_boundary = now.minute == 0
-            should_run_this_hour = ((now.hour - start_hour) % interval_hours == 0) if in_window else False
 
-            if in_window and on_boundary and should_run_this_hour and slot_key != last_run_slot:
+            if in_window:
                 logger.info(
                     f"定时窗口命中，当前时间: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                 )
                 migrate_next_class()
-                last_run_slot = slot_key
-
-            time.sleep(30)
+            else:
+                time.sleep(30)
     except KeyboardInterrupt:
         print("\n\n定时任务已停止")
 
@@ -2028,14 +2052,11 @@ def interactive_mode():
 
             elif choice == '5':
                 # 定时增量迁移
-                interval_input = input(f"\n请输入间隔小时数(默认{MIGRATION_CONFIG['schedule_interval']}): ").strip()
-                interval = int(interval_input) if interval_input else MIGRATION_CONFIG['schedule_interval']
-
-                print(f"\n将每 {interval} 小时迁移一个class")
+                print("\n将在北京时间每天 0:00-6:00 窗口内连续迁移class")
                 confirm = input("确认启动定时任务? (y/n): ").strip().lower()
 
                 if confirm == 'y':
-                    scheduled_migration(migrator, interval)
+                    scheduled_migration(migrator)
                 else:
                     print("已取消")
 
