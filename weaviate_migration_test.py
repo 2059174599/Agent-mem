@@ -1989,10 +1989,13 @@ def scheduled_migration(migrator: WeaviateMigrator):
             if result['success']:
                 logger.info(f"✓ Class '{class_name}' 迁移成功")
             else:
-                logger.error(f"✗ Class '{class_name}' 迁移失败")
+                error_msg = result['errors'][0] if result.get('errors') else "未知错误"
+                logger.error(f"✗ Class '{class_name}' 迁移失败: {error_msg}")
+                raise RuntimeError(f"定时迁移失败: class={class_name}, error={error_msg}")
 
         except Exception as e:
             logger.error(f"迁移 class '{class_name}' 时出错: {e}")
+            raise
 
         current_index += 1
 
@@ -2010,6 +2013,9 @@ def scheduled_migration(migrator: WeaviateMigrator):
                 time.sleep(30)
     except KeyboardInterrupt:
         print("\n\n定时任务已停止")
+    except Exception as e:
+        logger.error(f"定时任务因异常退出: {e}")
+        raise
 
 
 def interactive_mode():
