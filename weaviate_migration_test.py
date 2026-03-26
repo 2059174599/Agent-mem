@@ -971,28 +971,11 @@ class WeaviateMigrator:
             for cls in target_schema.get('classes', []):
                 if cls['class'] == class_name:
                     current_replication_factor = cls.get('replicationConfig', {}).get('factor', 1)
-                    target_replication_factor = self.get_target_default_replication_factor()
-
-                    if current_replication_factor < target_replication_factor:
-                        logger.info(
-                            f"Class '{class_name}' 已存在于目标实例，复制因子需要提升: "
-                            f"{current_replication_factor} -> {target_replication_factor}"
-                        )
-                        self.target_client.schema.update_config(
-                            class_name=class_name,
-                            config={
-                                "replicationConfig": {
-                                    "factor": target_replication_factor
-                                }
-                            }
-                        )
-                        logger.info(
-                            f"目标端 class '{class_name}' 复制因子已更新为: {target_replication_factor}"
-                        )
-                        return (True, target_replication_factor)
-
                     logger.info(f"Class '{class_name}' 已存在于目标实例，保留原配置")
-                    logger.info(f"目标端 class '{class_name}' 复制因子: {current_replication_factor}")
+                    logger.info(
+                        f"目标端 class '{class_name}' 复制因子: {current_replication_factor} "
+                        f"(已有class不做复制因子变更)"
+                    )
                     return (True, current_replication_factor)
 
             # 目标端class不存在，从目标集群状态获取复制因子
