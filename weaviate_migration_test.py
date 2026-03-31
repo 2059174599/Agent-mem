@@ -62,6 +62,7 @@ MIGRATION_CONFIG = {
     "schedule_timezone": "Asia/Shanghai",  # 定时任务时区
     "schedule_start_hour": 0,  # 每日允许执行开始时间（含）
     "schedule_end_hour": 6,  # 每日允许执行结束时间（不含）
+    "streaming_verify_threshold": 5000,  # 大 class 使用流式校验阈值
 }
 
 # 企业微信通知配置(可选，不配置则不发送通知)
@@ -627,6 +628,81 @@ class WeaviateMigrator:
 
         logger.info(f"总共获取了 {len(all_objects)} 个对象")
         return all_objects
+
+    def iter_objects_with_cursor(
+        self,
+        class_name: str,
+        client=None,
+        include_vector: bool = True,
+        include_metadata: bool = True,
+        limit: int = 100
+    ):
+        """
+        使用 cursor 分页迭代对象，避免一次性加载全部数据到内存
+        """
+        if client is None:
+            client = self.source_client
+
+        cursor = None
+        property_names = self.get_class_property_names(class_name, client)
+
+        additional_fields = ["id"]
+        if include_vector:
+            additional_fields.append("vector")
+        if include_metadata:
+            additional_fields.extend(["creationTimeUnix", "lastUpdateTimeUnix"])
+
+        while True:
+            query = (
+                client.query
+                .get(class_name, property_names)
+                .with_additional(additional_fields)
+                .with_limit(limit)
+            )
+
+            if cursor:
+                query = query.with_after(cursor)
+
+            result = query.do()
+            if "errors" in result:
+                raise Exception(result["errors"])
+
+            objects = result.get('data', {}).get('Get', {}).get(class_name, [])
+            if not objects:
+                break
+
+            yield objects
+
+            cursor = objects[-1]['_additional']['id']
+            if len(objects) < limit:
+                break
+
+    def fetch_first_objects(
+        self,
+        class_name: str,
+        client=None,
+        include_vector: bool = True,
+        include_metadata: bool = True,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        只获取前 N 个对象，适合抽样验证
+        """
+        if client is None:
+            client = self.source_client
+
+        try:
+            return next(
+                self.iter_objects_with_cursor(
+                    class_name,
+                    client=client,
+                    include_vector=include_vector,
+                    include_metadata=include_metadata,
+                    limit=limit
+                )
+            )
+        except StopIteration:
+            return []
 
     def compute_object_hash(self, obj: Dict[str, Any]) -> str:
         """
@@ -1202,6 +1278,48 @@ class WeaviateMigrator:
         logger.info(f"迁移完成: 成功 {stats['success']}, 失败 {stats['failed']}")
         return stats
 
+    def migrate_objects_streaming(
+        self,
+        class_name: str,
+        total_count: int,
+        mode: str = "full"
+    ) -> Dict[str, Any]:
+        """
+        流式迁移对象，适合大 class，按分页拉取并即时写入
+        """
+        stats = {
+            'total': total_count,
+            'success': 0,
+            'failed': 0,
+            'errors': [],
+            'max_update_time': None,
+        }
+
+        logger.info(f"开始流式迁移 class '{class_name}'，预计对象数 {total_count} (模式: {mode})...")
+
+        with tqdm(total=total_count, desc=f"流式迁移 {class_name}", unit="对象", **self._tqdm_kwargs()) as pbar:
+            for objects in self.iter_objects_with_cursor(
+                class_name,
+                client=self.source_client,
+                include_vector=True,
+                include_metadata=True,
+                limit=self.batch_size
+            ):
+                batch_stats = self.migrate_objects(class_name, objects, mode=mode)
+                stats['success'] += batch_stats['success']
+                stats['failed'] += batch_stats['failed']
+                stats['errors'].extend(batch_stats['errors'][:10])
+
+                batch_max_update_time = self.get_max_last_update_time_from_objects(objects)
+                if batch_max_update_time is not None:
+                    if stats['max_update_time'] is None or batch_max_update_time > stats['max_update_time']:
+                        stats['max_update_time'] = batch_max_update_time
+
+                pbar.update(len(objects))
+
+        logger.info(f"流式迁移完成: 成功 {stats['success']}, 失败 {stats['failed']}")
+        return stats
+
     def verify_migration(
         self,
         class_name: str,
@@ -1241,7 +1359,7 @@ class WeaviateMigrator:
                 )
 
             # 2. 抽样检查metadata完整性
-            sample_objects_source = self.fetch_all_objects_with_cursor(
+            sample_objects_source = self.fetch_first_objects(
                 class_name,
                 client=self.source_client,
                 limit=10
@@ -1475,6 +1593,32 @@ class WeaviateMigrator:
         }
 
         try:
+            source_count = self.get_class_object_count(class_name, "source")
+            if source_count >= MIGRATION_CONFIG["streaming_verify_threshold"]:
+                logger.info(
+                    f"class '{class_name}' 数据量较大({source_count})，使用流式校验替代全量内存比对"
+                )
+                stream_verification = self.verify_with_hash_streaming(
+                    class_name,
+                    batch_size=self.batch_size,
+                    include_vector=False
+                )
+                verification["source_count"] = stream_verification.get("total_source", 0)
+                verification["target_count"] = stream_verification.get("total_target", 0)
+                verification["added_diff"] = len(stream_verification.get("missing_ids", []))
+                verification["updated_diff"] = len(stream_verification.get("mismatched_ids", []))
+                verification["deleted_diff"] = max(
+                    0,
+                    stream_verification.get("total_target", 0) - stream_verification.get("total_source", 0)
+                )
+                verification["passed"] = stream_verification.get("passed", False)
+                verification["errors"].extend(stream_verification.get("errors", []))
+                if not verification["passed"] and not verification["errors"]:
+                    verification["errors"].append(
+                        f"流式校验存在差异: 缺失 {verification['added_diff']} / 不匹配 {verification['updated_diff']}"
+                    )
+                return verification
+
             diff = self.hash_based_incremental(class_name)
             verification["source_count"] = diff.get("source_count", 0)
             verification["target_count"] = diff.get("target_count", 0)
@@ -1604,12 +1748,9 @@ class WeaviateMigrator:
                             self.notifier.notify_migration_failed(class_name, sync_mode, "清空目标数据失败")
                         return result
 
-                # 获取所有对象
-                objects = self.fetch_all_objects_with_cursor(class_name)
-                source_max_update_time = self.get_max_last_update_time_from_objects(objects)
-
-                # 迁移对象
-                migration_stats = self.migrate_objects(class_name, objects, mode="full")
+                # 流式迁移对象，避免大 class 一次性加载全部对象到内存
+                migration_stats = self.migrate_objects_streaming(class_name, source_count, mode="full")
+                source_max_update_time = migration_stats.get('max_update_time')
                 result['migrated_count'] = migration_stats['success']
 
                 if migration_stats['failed'] > 0:
