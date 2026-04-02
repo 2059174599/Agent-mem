@@ -62,6 +62,7 @@ MIGRATION_CONFIG = {
     "schedule_timezone": "Asia/Shanghai",  # 定时任务时区
     "schedule_start_hour": 0,  # 每日允许执行开始时间（含）
     "schedule_end_hour": 6,  # 每日允许执行结束时间（不含）
+    "large_class_full_sync_threshold": 5000,  # 大 class 直接切换为流式全量覆盖
     "streaming_verify_threshold": 5000,  # 大 class 使用流式校验阈值
 }
 
@@ -1717,6 +1718,12 @@ class WeaviateMigrator:
                     # 目标没数据 -> 全量同步
                     sync_mode = "full"
                     logger.info(f"目标class为空,执行全量同步")
+                elif source_count >= MIGRATION_CONFIG["large_class_full_sync_threshold"]:
+                    sync_mode = "full"
+                    logger.info(
+                        f"大class检测: source_count={source_count} >= "
+                        f"{MIGRATION_CONFIG['large_class_full_sync_threshold']}，切换为流式全量覆盖"
+                    )
                 else:
                     # 目标有数据 -> 增量同步
                     sync_mode = "incremental"
