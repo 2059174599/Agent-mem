@@ -62,6 +62,7 @@ MIGRATION_CONFIG = {
     "schedule_timezone": "Asia/Shanghai",  # 定时任务时区
     "schedule_start_hour": 0,  # 每日允许执行开始时间（含）
     "schedule_end_hour": 6,  # 每日允许执行结束时间（不含）
+    "scheduled_skip_large_class_threshold": 10000,  # 定时任务跳过超大 class
     "large_class_full_sync_threshold": 5000,  # 大 class 直接切换为流式全量覆盖
     "streaming_verify_threshold": 5000,  # 大 class 使用流式校验阈值
 }
@@ -2095,10 +2096,12 @@ def scheduled_migration(migrator: WeaviateMigrator):
     timezone_name = MIGRATION_CONFIG["schedule_timezone"]
     start_hour = MIGRATION_CONFIG["schedule_start_hour"]
     end_hour = MIGRATION_CONFIG["schedule_end_hour"]
+    skip_large_threshold = MIGRATION_CONFIG["scheduled_skip_large_class_threshold"]
 
     print(f"\n启动定时增量迁移")
     print(f"执行窗口: 每天 {start_hour:02d}:00 - {end_hour:02d}:00 ({timezone_name})")
     print("窗口内将按 class 顺序连续迁移，跑完一个接着跑下一个")
+    print(f"超大class跳过阈值: {skip_large_threshold}")
     print("按 Ctrl+C 停止定时任务\n")
 
     classes = migrator.get_all_classes()
@@ -2115,7 +2118,15 @@ def scheduled_migration(migrator: WeaviateMigrator):
         logger.info(f"\n定时任务: 开始迁移 class '{class_name}'")
 
         try:
-            result = migrator.migrate_class(class_name, force=False, mode="auto")
+            source_count = migrator.get_class_object_count(class_name, "source")
+            if source_count > skip_large_threshold:
+                logger.warning(
+                    f"Class '{class_name}' 数据量 {source_count} 超过定时任务阈值 {skip_large_threshold}，本轮跳过"
+                )
+                current_index += 1
+                return
+
+            result = migrator.migrate_class(class_name, force=False, mode="incremental")
 
             if result['success']:
                 logger.info(f"✓ Class '{class_name}' 迁移成功")
