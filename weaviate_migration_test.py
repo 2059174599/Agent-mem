@@ -65,6 +65,8 @@ MIGRATION_CONFIG = {
     "scheduled_skip_large_class_threshold": 10000,  # 定时任务跳过超大 class
     "large_class_full_sync_threshold": 5000,  # 大 class 直接切换为流式全量覆盖
     "streaming_verify_threshold": 5000,  # 大 class 使用流式校验阈值
+    "verify_count_retry_times": 5,  # 目标端计数重试次数
+    "verify_count_retry_interval": 1,  # 目标端计数重试间隔（秒）
 }
 
 # 企业微信通知配置(可选，不配置则不发送通知)
@@ -1345,14 +1347,32 @@ class WeaviateMigrator:
             'actual_count': 0,
             'match': False,
             'sample_check': False,
+            'count_retry_used': 0,
             'errors': []
         }
 
         try:
             # 1. 检查总数
-            actual_count = self.get_class_object_count(class_name, "target")
+            actual_count = 0
+            retry_times = MIGRATION_CONFIG["verify_count_retry_times"]
+            retry_interval = MIGRATION_CONFIG["verify_count_retry_interval"]
+
+            for attempt in range(retry_times):
+                actual_count = self.get_class_object_count(class_name, "target")
+                verification['actual_count'] = actual_count
+                verification['count_retry_used'] = attempt
+
+                if actual_count == expected_count:
+                    break
+
+                if attempt < retry_times - 1:
+                    logger.warning(
+                        f"验证计数未收敛: class='{class_name}', 预期={expected_count}, 实际={actual_count}, "
+                        f"{retry_interval}秒后重试({attempt + 1}/{retry_times})"
+                    )
+                    time.sleep(retry_interval)
+
             target_property_names = self.get_class_property_names(class_name, self.target_client)
-            verification['actual_count'] = actual_count
             verification['match'] = (actual_count == expected_count)
 
             if not verification['match']:
@@ -1775,8 +1795,22 @@ class WeaviateMigrator:
                     strict_verification['passed']
                 )
 
+                if verification['errors']:
+                    result['errors'].extend(verification['errors'])
                 if strict_verification['errors']:
                     result['errors'].extend(strict_verification['errors'])
+
+                # 严格一致性通过时，允许覆盖聚合计数的瞬时抖动
+                if (
+                    migration_stats['failed'] == 0 and
+                    verification['sample_check'] and
+                    strict_verification['passed']
+                ):
+                    if not verification['match']:
+                        logger.warning(
+                            f"class '{class_name}' 聚合计数存在短暂抖动，但严格一致性校验已通过，按成功处理"
+                        )
+                    result['success'] = True
 
                 # 记录状态
                 self.state_manager.update_class_state(
