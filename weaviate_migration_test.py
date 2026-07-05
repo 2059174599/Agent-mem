@@ -32,27 +32,16 @@ from zoneinfo import ZoneInfo
 
 # # 源Weaviate配置 -测试
 # SOURCE_CONFIG = {
-#     "endpoint": "http://weaviate-db.paas.paas.test",
-#     "api_key": "WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih"
+#     "endpoint": "",
+#     "api_key": ""
 # }
 #
 # # 目标Weaviate配置 - 测试
 # TARGET_CONFIG = {
-#     "endpoint": "http://weaviate-db-pre.aigc.paas.test",  # 修改为目标地址
-#     "api_key": "WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih"  # 修改为目标API Key
+#     "endpoint": "",  # 修改为目标地址
+#     "api_key": ""  # 修改为目标API Key
 # }
 
-# 源Weaviate配置 -生产
-SOURCE_CONFIG = {
-    "endpoint": "http://weaviate2201.8080-wm.db.idc:8080",
-    "api_key": "sdhznq4wyyRqlQg9evy]"
-}
-
-# 目标Weaviate配置 - 生产
-TARGET_CONFIG = {
-    "endpoint": "http://weaviate2202.8081-wm.db.idc:8081",  # 修改为目标地址
-    "api_key": "xbph0bs=mkjkGiy9yaiT"  # 修改为目标API Key
-}
 
 # 迁移配置
 MIGRATION_CONFIG = {

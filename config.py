@@ -121,11 +121,11 @@ class Config:
     
     @classmethod
     def get_llm_base_url(cls) -> str:
-        return cls.get_env_or_default("LLM_BASE_URL", "http://aigc-api.aigc.paas.corp/v1/chat/completions")
+        return cls.get_env_or_default("LLM_BASE_URL", "")
     
     @classmethod
     def get_llm_api_key(cls) -> str:
-        return cls.get_env_or_default("LLM_API_KEY", "sk-ftmE4M3322c945i6A3TONZk8Oe2Op7nB1hChD3029EJGLX1A")
+        return cls.get_env_or_default("LLM_API_KEY", "")
     
     @classmethod
     def get_llm_model(cls) -> str:
@@ -149,11 +149,11 @@ class Config:
     
     @classmethod
     def get_embedding_base_url(cls) -> str:
-        return cls.get_env_or_default("EMBEDDING_BASE_URL", "http://aigc-api.aigc.paas.test/v1/embeddings")
+        return cls.get_env_or_default("EMBEDDING_BASE_URL", "")
     
     @classmethod
     def get_embedding_api_key(cls) -> str:
-        return cls.get_env_or_default("EMBEDDING_API_KEY", "sk-YC9Utxm3F4WBjQqFWCwuU9Tdk26i45zDa6637w7rTc3WyvYP")
+        return cls.get_env_or_default("EMBEDDING_API_KEY", "")
     
     @classmethod
     def get_embedding_model(cls) -> str:
